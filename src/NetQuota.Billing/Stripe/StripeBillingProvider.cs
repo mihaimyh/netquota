@@ -175,9 +175,7 @@ public sealed class StripeBillingProvider
         using var response = await _http.GetAsync(
             $"v1/subscriptions?customer={Uri.EscapeDataString(customerId)}&status=all&limit=20",
             cancellationToken);
-        response.EnsureSuccessStatusCode();
-
-        using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellationToken));
+        using var document = await BillingHttpResponse.ReadJsonOrThrowAsync(response, Name, cancellationToken);
         var bestTier = _options.DefaultTier;
         var bestRank = -1;
         var sawActive = false;
@@ -231,17 +229,13 @@ public sealed class StripeBillingProvider
 
         var now = updatedAtUtc ?? _time.GetUtcNow();
         await _store.SetEntitlementAsync(
-            new QuotaEntitlement(
-                UserId: userId,
-                Tier: bestTier,
-                SubscriptionStartDateUtc: start ?? existing?.SubscriptionStartDateUtc ?? now,
-                UpdatedAtUtc: now,
-                ExpiresAtUtc: end ?? existing?.ExpiresAtUtc,
-                Promotion: existing?.Promotion,
-                Timezone: existing?.Timezone,
-                Sealed: existing?.Sealed ?? false,
-                MigratedTo: existing?.MigratedTo,
-                SealExpiresAtUtc: existing?.SealExpiresAtUtc),
+            BillingEntitlementTransition.Merge(
+                userId: userId,
+                tier: bestTier,
+                existing: existing,
+                updatedAtUtc: now,
+                subscriptionStartDateUtc: start,
+                expiresAtUtc: end),
             cancellationToken);
 
         return bestTier;
@@ -356,7 +350,6 @@ public sealed class StripeBillingProvider
         });
 
         using var response = await _http.PostAsync("v1/billing_portal/sessions", content, cancellationToken);
-        response.EnsureSuccessStatusCode();
         return await ReadUrlAsync(response, cancellationToken);
     }
 
@@ -380,9 +373,7 @@ public sealed class StripeBillingProvider
         request.Headers.Add("Idempotency-Key", $"netquota-customer-{userId}");
 
         using var response = await _http.SendAsync(request, cancellationToken);
-        response.EnsureSuccessStatusCode();
-
-        using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellationToken));
+        using var document = await BillingHttpResponse.ReadJsonOrThrowAsync(response, Name, cancellationToken);
         var customerId = StripeWebhookParser.Text(document.RootElement, "id")
                          ?? throw new BillingNotSupportedException("Stripe customer creation returned no id.");
 
@@ -397,13 +388,12 @@ public sealed class StripeBillingProvider
     {
         using var content = new FormUrlEncodedContent(form);
         using var response = await _http.PostAsync("v1/checkout/sessions", content, cancellationToken);
-        response.EnsureSuccessStatusCode();
         return await ReadUrlAsync(response, cancellationToken);
     }
 
-    private static async Task<string> ReadUrlAsync(HttpResponseMessage response, CancellationToken cancellationToken)
+    private async Task<string> ReadUrlAsync(HttpResponseMessage response, CancellationToken cancellationToken)
     {
-        using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellationToken));
+        using var document = await BillingHttpResponse.ReadJsonOrThrowAsync(response, Name, cancellationToken);
         return StripeWebhookParser.Text(document.RootElement, "url")
                ?? throw new BillingNotSupportedException("Stripe returned no redirect URL.");
     }
@@ -418,23 +408,19 @@ public sealed class StripeBillingProvider
         // Strictly older events lose. Equal timestamps are applied because Stripe emits several
         // events in the same second (`subscription.updated` + `invoice.paid`); replays at the same
         // timestamp rewrite the same values, and money paths are idempotent by event id.
-        if (existing is not null && evt.EventTimestamp < existing.UpdatedAtUtc)
+        if (BillingEntitlementTransition.IsStale(existing, evt.EventTimestamp))
         {
             return null;
         }
 
         var now = evt.EventTimestamp == default ? _time.GetUtcNow() : evt.EventTimestamp;
-        var entitlement = new QuotaEntitlement(
-            UserId: evt.UserId,
-            Tier: tier,
-            SubscriptionStartDateUtc: evt.PurchasedAt ?? existing?.SubscriptionStartDateUtc ?? now,
-            UpdatedAtUtc: now,
-            ExpiresAtUtc: evt.ExpiresAt ?? existing?.ExpiresAtUtc,
-            Promotion: existing?.Promotion,
-            Timezone: existing?.Timezone,
-            Sealed: existing?.Sealed ?? false,
-            MigratedTo: existing?.MigratedTo,
-            SealExpiresAtUtc: existing?.SealExpiresAtUtc);
+        var entitlement = BillingEntitlementTransition.Merge(
+            userId: evt.UserId,
+            tier: tier,
+            existing: existing,
+            updatedAtUtc: now,
+            subscriptionStartDateUtc: evt.PurchasedAt,
+            expiresAtUtc: evt.ExpiresAt);
 
         await _store.SetEntitlementAsync(entitlement, cancellationToken);
         _metrics?.RecordApplied(Name, evt.EventType, tier);

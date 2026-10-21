@@ -702,4 +702,89 @@ public class NetQuotaBillingTests
         var ok = await WebhookBodyReader.ReadAsync(new MemoryStream(Encoding.UTF8.GetBytes("{}")));
         Assert.Equal(2, ok.Length);
     }
+
+    [Fact]
+    public void BillingEntitlementTransition_PreservesPromotionTimezoneAndSeal()
+    {
+        var now = DateTimeOffset.UtcNow;
+        var promotion = new TierPromotion("vip", now.AddDays(-5), now.AddDays(5));
+        var existing = new QuotaEntitlement(
+            UserId: "u1",
+            Tier: "free",
+            SubscriptionStartDateUtc: now.AddDays(-30),
+            UpdatedAtUtc: now.AddHours(-2),
+            ExpiresAtUtc: now.AddDays(10),
+            Promotion: promotion,
+            Timezone: "Europe/Bucharest",
+            Sealed: true,
+            MigratedTo: "u2",
+            SealExpiresAtUtc: now.AddHours(6));
+
+        var merged = BillingEntitlementTransition.Merge("u1", "pro", existing, now);
+
+        Assert.Equal("pro", merged.Tier);
+        Assert.Equal(promotion, merged.Promotion);
+        Assert.Equal("Europe/Bucharest", merged.Timezone);
+        Assert.True(merged.Sealed);
+        Assert.Equal("u2", merged.MigratedTo);
+        Assert.Equal(existing.SealExpiresAtUtc, merged.SealExpiresAtUtc);
+        Assert.Equal(existing.SubscriptionStartDateUtc, merged.SubscriptionStartDateUtc);
+        Assert.Equal(existing.ExpiresAtUtc, merged.ExpiresAtUtc);
+
+        var clearedExpiry = BillingEntitlementTransition.Merge(
+            "u1", "free", existing, now, preserveExistingExpiry: false);
+        Assert.Null(clearedExpiry.ExpiresAtUtc);
+
+        Assert.True(BillingEntitlementTransition.IsStale(existing, existing.UpdatedAtUtc.AddSeconds(-1)));
+        Assert.False(BillingEntitlementTransition.IsStale(existing, existing.UpdatedAtUtc));
+    }
+
+    [Fact]
+    public async Task ProviderHttpErrors_SurfaceStructuredBillingProviderException()
+    {
+        var stripeCustomers = new InMemoryBillingCustomerStore();
+        await stripeCustomers.SaveCustomerIdAsync("stripe", "u1", "cus_1");
+
+        var stripeHandler = new RecordingHandler((_, _) =>
+        {
+            var response = Json(
+                """{"error":{"code":"resource_missing","type":"invalid_request_error","message":"No such price: 'price_pro'"}}""",
+                HttpStatusCode.BadRequest);
+            response.Headers.Add("Request-Id", "req_stripe_123");
+            return response;
+        });
+
+        var stripe = new StripeBillingProvider(
+            StripeOptionsForTests(), new FakeStore(), stripeCustomers, new HttpClient(stripeHandler));
+
+        var stripeEx = await Assert.ThrowsAsync<BillingProviderException>(() =>
+            stripe.CheckoutUrlAsync("u1", "pro", "https://ok", "https://cancel"));
+
+        Assert.Equal("stripe", stripeEx.Provider);
+        Assert.Equal(HttpStatusCode.BadRequest, stripeEx.StatusCode);
+        Assert.Equal("resource_missing", stripeEx.ErrorCode);
+        Assert.Equal("No such price: 'price_pro'", stripeEx.ErrorMessage);
+        Assert.Equal("req_stripe_123", stripeEx.RequestId);
+
+        var rcHandler = new RecordingHandler((_, _) =>
+        {
+            var response = Json(
+                """{"code":7225,"message":"Invalid API Key."}""",
+                HttpStatusCode.Unauthorized);
+            response.Headers.Add("X-Request-Id", "req_rc_456");
+            return response;
+        });
+
+        var rc = new RevenueCatBillingProvider(
+            RevenueCatOptionsForTests(), new FakeStore(), new HttpClient(rcHandler));
+
+        var rcEx = await Assert.ThrowsAsync<BillingProviderException>(() =>
+            rc.SyncUserAsync("u1"));
+
+        Assert.Equal("revenuecat", rcEx.Provider);
+        Assert.Equal(HttpStatusCode.Unauthorized, rcEx.StatusCode);
+        Assert.Equal("7225", rcEx.ErrorCode);
+        Assert.Equal("Invalid API Key.", rcEx.ErrorMessage);
+        Assert.Equal("req_rc_456", rcEx.RequestId);
+    }
 }

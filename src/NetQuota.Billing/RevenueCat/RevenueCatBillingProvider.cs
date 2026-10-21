@@ -117,25 +117,17 @@ public sealed class RevenueCatBillingProvider
         }
 
         using var response = await _http.SendAsync(request, cancellationToken);
-        response.EnsureSuccessStatusCode();
-
-        using var document = JsonDocument.Parse(await response.Content.ReadAsStringAsync(cancellationToken));
+        using var document = await BillingHttpResponse.ReadJsonOrThrowAsync(response, Name, cancellationToken);
         var tier = ResolveTierFromSubscriber(document.RootElement);
 
         var existing = await _store.GetEntitlementAsync(userId, cancellationToken);
         var now = _time.GetUtcNow();
         await _store.SetEntitlementAsync(
-            new QuotaEntitlement(
-                UserId: userId,
-                Tier: tier,
-                SubscriptionStartDateUtc: existing?.SubscriptionStartDateUtc ?? now,
-                UpdatedAtUtc: now,
-                ExpiresAtUtc: existing?.ExpiresAtUtc,
-                Promotion: existing?.Promotion,
-                Timezone: existing?.Timezone,
-                Sealed: existing?.Sealed ?? false,
-                MigratedTo: existing?.MigratedTo,
-                SealExpiresAtUtc: existing?.SealExpiresAtUtc),
+            BillingEntitlementTransition.Merge(
+                userId: userId,
+                tier: tier,
+                existing: existing,
+                updatedAtUtc: now),
             cancellationToken);
 
         return tier;
@@ -147,23 +139,19 @@ public sealed class RevenueCatBillingProvider
 
         // Strictly older events lose; equal timestamps are applied because several RevenueCat
         // events can share a second, and replays rewrite the same values.
-        if (existing is not null && evt.EventTimestamp < existing.UpdatedAtUtc)
+        if (BillingEntitlementTransition.IsStale(existing, evt.EventTimestamp))
         {
             return;
         }
 
         var now = evt.EventTimestamp == default ? _time.GetUtcNow() : evt.EventTimestamp;
-        var entitlement = new QuotaEntitlement(
-            UserId: evt.UserId,
-            Tier: evt.NewTier,
-            SubscriptionStartDateUtc: evt.PurchasedAt ?? existing?.SubscriptionStartDateUtc ?? now,
-            UpdatedAtUtc: now,
-            ExpiresAtUtc: evt.ExpiresAt ?? existing?.ExpiresAtUtc,
-            Promotion: existing?.Promotion,
-            Timezone: existing?.Timezone,
-            Sealed: existing?.Sealed ?? false,
-            MigratedTo: existing?.MigratedTo,
-            SealExpiresAtUtc: existing?.SealExpiresAtUtc);
+        var entitlement = BillingEntitlementTransition.Merge(
+            userId: evt.UserId,
+            tier: evt.NewTier,
+            existing: existing,
+            updatedAtUtc: now,
+            subscriptionStartDateUtc: evt.PurchasedAt,
+            expiresAtUtc: evt.ExpiresAt);
 
         await _store.SetEntitlementAsync(entitlement, cancellationToken);
         _metrics?.RecordApplied(Name, evt.EventType, evt.NewTier);
@@ -194,22 +182,20 @@ public sealed class RevenueCatBillingProvider
             }
 
             var existing = await _store.GetEntitlementAsync(destination, cancellationToken);
-            if (IsStale(existing, eventTimestamp))
+            if (BillingEntitlementTransition.IsStale(existing, eventTimestamp))
             {
                 continue;
             }
 
-            var entitlement = new QuotaEntitlement(
-                UserId: destination,
-                Tier: snapshot.Tier,
-                SubscriptionStartDateUtc: snapshot.SubscriptionStartDateUtc,
-                UpdatedAtUtc: TransferUpdatedAt(eventTimestamp, existing),
-                ExpiresAtUtc: snapshot.ExpiresAtUtc,
-                Promotion: existing?.Promotion,
-                Timezone: snapshot.Timezone ?? existing?.Timezone,
-                Sealed: existing?.Sealed ?? false,
-                MigratedTo: existing?.MigratedTo,
-                SealExpiresAtUtc: existing?.SealExpiresAtUtc);
+            var entitlement = BillingEntitlementTransition.Merge(
+                userId: destination,
+                tier: snapshot.Tier,
+                existing: existing,
+                updatedAtUtc: TransferUpdatedAt(eventTimestamp, existing),
+                subscriptionStartDateUtc: snapshot.SubscriptionStartDateUtc,
+                expiresAtUtc: snapshot.ExpiresAtUtc,
+                preserveExistingExpiry: false,
+                timezoneOverride: snapshot.Timezone);
 
             await _store.SetEntitlementAsync(entitlement, cancellationToken);
             _metrics?.RecordTransfer(Name, "to");
@@ -223,21 +209,18 @@ public sealed class RevenueCatBillingProvider
         foreach (var source in fromIds)
         {
             var existing = await _store.GetEntitlementAsync(source, cancellationToken);
-            if (IsStale(existing, eventTimestamp))
+            if (BillingEntitlementTransition.IsStale(existing, eventTimestamp))
             {
                 continue;
             }
 
-            var entitlement = new QuotaEntitlement(
-                UserId: source,
-                Tier: _options.DefaultTier,
-                SubscriptionStartDateUtc: existing?.SubscriptionStartDateUtc ?? DateTimeOffset.UnixEpoch,
-                UpdatedAtUtc: TransferUpdatedAt(eventTimestamp, existing),
-                Promotion: existing?.Promotion,
-                Timezone: existing?.Timezone,
-                Sealed: existing?.Sealed ?? false,
-                MigratedTo: existing?.MigratedTo,
-                SealExpiresAtUtc: existing?.SealExpiresAtUtc);
+            var entitlement = BillingEntitlementTransition.Merge(
+                userId: source,
+                tier: _options.DefaultTier,
+                existing: existing,
+                updatedAtUtc: TransferUpdatedAt(eventTimestamp, existing),
+                subscriptionStartDateUtc: existing?.SubscriptionStartDateUtc ?? DateTimeOffset.UnixEpoch,
+                preserveExistingExpiry: false);
 
             await _store.SetEntitlementAsync(entitlement, cancellationToken);
             _metrics?.RecordTransfer(Name, "from");
@@ -307,9 +290,6 @@ public sealed class RevenueCatBillingProvider
         string.Equals(tier, _options.DefaultTier, StringComparison.OrdinalIgnoreCase)
             ? 0
             : 1;
-
-    private static bool IsStale(QuotaEntitlement? existing, DateTimeOffset eventTimestamp) =>
-        existing is not null && eventTimestamp != default && eventTimestamp < existing.UpdatedAtUtc;
 
     private static DateTimeOffset TransferUpdatedAt(DateTimeOffset eventTimestamp, QuotaEntitlement? existing) =>
         eventTimestamp != default

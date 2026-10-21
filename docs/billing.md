@@ -70,6 +70,10 @@ Rules that matter:
   credit packs, so refunds arrive with the fields needed.
 - Checkout creates the customer with an `Idempotency-Key`; a persistence failure surfaces instead of
   silently creating a duplicate on the next attempt.
+- Outgoing REST errors throw `BillingProviderException` (a subclass of `HttpRequestException`) with
+  `StatusCode`, `ErrorCode`, `ErrorMessage` and `RequestId`.
+- Entitlement rewrites go through `BillingEntitlementTransition.Merge`, preserving `Promotion`,
+  `Timezone`, `Sealed`, `MigratedTo` and `SealExpiresAtUtc`.
 
 ## RevenueCat
 
