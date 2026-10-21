@@ -1,6 +1,5 @@
 workflow: GitHubFlow/v1
 tag-prefix: '[vV]'
-next-version: 1.0.0
 semantic-version-format: Strict
 
 major-version-bump-message: '\+semver:\s?(breaking|major)'
