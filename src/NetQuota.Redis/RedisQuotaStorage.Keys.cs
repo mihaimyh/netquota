@@ -31,10 +31,16 @@ public sealed partial class RedisQuotaStorage
     private string RateLimitGlobalKey(string resource) =>
         $"{_options.KeyPrefix}ratelimit_global:{Segment(resource)}";
 
-    private static string ScopedKey(string userId, string idempotencyKey) =>
-        idempotencyKey.StartsWith($"{userId}:", StringComparison.Ordinal)
+    // Scoping must be injective: joining raw fields made ("a:b", "c") and ("a", "b:c") produce the
+    // same record key, so one user's request replayed another user's charge. Escape each segment
+    // exactly like UsageKey/DistinctKey; ids without reserved characters keep their legacy key.
+    private static string ScopedKey(string userId, string idempotencyKey)
+    {
+        var prefix = $"{Segment(userId)}:";
+        return idempotencyKey.StartsWith(prefix, StringComparison.Ordinal)
             ? idempotencyKey
-            : $"{userId}:{idempotencyKey}";
+            : prefix + Segment(idempotencyKey);
+    }
 
     private static string Segment(string raw) => Uri.EscapeDataString(raw);
 }

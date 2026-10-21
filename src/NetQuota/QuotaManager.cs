@@ -59,10 +59,22 @@ public sealed class QuotaManager
     private static IQuotaStorage UnwrapStorage(IQuotaStorage storage) =>
         storage is CircuitBreakerQuotaStorage { InnerStorage: var inner } ? UnwrapStorage(inner) : storage;
 
-    public static string ScopedIdempotencyKey(string userId, string? key) =>
-        string.IsNullOrWhiteSpace(key)
-            ? string.Empty
-            : (key.StartsWith($"{userId}:", StringComparison.Ordinal) ? key : $"{userId}:{key}");
+    /// <summary>
+    /// Scopes a caller-supplied idempotency key to one user. Each part is percent-encoded before the
+    /// join, so <c>("a:b", "c")</c> and <c>("a", "b:c")</c> no longer produce the same scoped key.
+    /// </summary>
+    public static string ScopedIdempotencyKey(string userId, string? key)
+    {
+        if (string.IsNullOrWhiteSpace(key))
+        {
+            return string.Empty;
+        }
+
+        var prefix = $"{Uri.EscapeDataString(userId)}:";
+        return key.StartsWith(prefix, StringComparison.Ordinal)
+            ? key
+            : prefix + Uri.EscapeDataString(key);
+    }
 
     public async Task<DateTimeOffset> GetNowUtcAsync(CancellationToken cancellationToken = default)
     {

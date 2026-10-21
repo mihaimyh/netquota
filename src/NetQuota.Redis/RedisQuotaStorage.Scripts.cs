@@ -38,6 +38,9 @@ public sealed partial class RedisQuotaStorage
         local used = tonumber(redis.call('HGET', usageKey, 'used') or '0')
         local storedLimit = redis.call('HGET', usageKey, 'limit')
         local storedTier = redis.call('HGET', usageKey, 'tier')
+        -- "No tier supplied" is not "the tier is empty": keep the stored tier so a direct storage
+        -- caller (EffectiveTier is optional on the contract) cannot erase a prorated cap.
+        local effectiveTier = tier ~= '' and tier or (storedTier or '')
 
         local limit = configuredLimit
         if periodType == 'Forever' then
@@ -45,7 +48,7 @@ public sealed partial class RedisQuotaStorage
         elseif configuredLimit == -1 then
             -- The tier's unlimited quota wins over a stored cap (goquota 4782f75).
             limit = -1
-        elseif storedLimit and storedTier and tier ~= '' and string.lower(storedTier) == string.lower(tier) and tonumber(storedLimit) ~= 0 then
+        elseif storedLimit and storedTier and effectiveTier ~= '' and string.lower(storedTier) == string.lower(effectiveTier) and tonumber(storedLimit) ~= 0 then
             -- Preserve prorated limits written by ApplyTierChange for the current tier.
             limit = tonumber(storedLimit)
         end
@@ -69,11 +72,15 @@ public sealed partial class RedisQuotaStorage
 
         local newUsed = used + amount
         redis.call('HSET', usageKey,
-            'used', newUsed, 'limit', limit, 'tier', tier,
+            'used', newUsed, 'limit', limit, 'tier', effectiveTier,
             'periodType', periodType, 'periodKey', periodKey,
             'periodStartUtc', periodStart, 'periodEndUtc', periodEnd,
             'updatedAtUtc', nowIso)
-        if distinctMember ~= '' then redis.call('SADD', distinctKey, distinctMember) end
+        if distinctMember ~= '' then
+            redis.call('SADD', distinctKey, distinctMember)
+            -- The distinct set belongs to the same window as the usage hash and must expire with it.
+            if usageTtl > 0 then redis.call('EXPIRE', distinctKey, usageTtl) end
+        end
         if usageTtl > 0 then redis.call('EXPIRE', usageKey, usageTtl) end
 
         membersJson = cjson.encode(redis.call('SMEMBERS', distinctKey))
@@ -188,6 +195,7 @@ public sealed partial class RedisQuotaStorage
     private static readonly string DrainScript = """
         local usageKey = KEYS[1]
         local nowIso = ARGV[1]
+        local usageTtl = tonumber(ARGV[2])
 
         local used = 0
         if redis.call('EXISTS', usageKey) == 1 then
@@ -196,6 +204,9 @@ public sealed partial class RedisQuotaStorage
         if used < 0 then used = 0 end
 
         redis.call('HSET', usageKey, 'used', used, 'limit', used, 'updatedAtUtc', nowIso)
+        -- Draining before the first consume creates the recurring usage hash; without a TTL Redis
+        -- keeps one permanent key per drained window.
+        if usageTtl and usageTtl > 0 then redis.call('EXPIRE', usageKey, usageTtl) end
         return 1
         """;
 
@@ -273,6 +284,7 @@ public sealed partial class RedisQuotaStorage
             for i = 8, #ARGV do
                 redis.call('SADD', distinctKey, ARGV[i])
             end
+            if tonumber(ARGV[5]) > 0 then redis.call('EXPIRE', distinctKey, tonumber(ARGV[5])) end
         end
         return 1
         """;
@@ -287,6 +299,7 @@ public sealed partial class RedisQuotaStorage
         for i = 6, #ARGV do
             redis.call('SADD', distinctKey, ARGV[i])
         end
+        if tonumber(ARGV[5]) > 0 then redis.call('EXPIRE', distinctKey, tonumber(ARGV[5])) end
         return 1
         """;
 
@@ -342,14 +355,30 @@ public sealed partial class RedisQuotaStorage
 
     private static readonly string TokenBucketScript = """
         local key = KEYS[1]
+        local globalKey = KEYS[2]
         local nowMs = tonumber(ARGV[1])
         local rate = tonumber(ARGV[2])
         local windowMs = tonumber(ARGV[3])
         local burst = tonumber(ARGV[4])
         local ttl = tonumber(ARGV[5])
+        local globalLimit = tonumber(ARGV[6])
+        local member = ARGV[7]
 
         if rate <= 0 or windowMs <= 0 or burst <= 0 then
             return { 0, 0, nowMs + windowMs }
+        end
+
+        -- The per-resource global budget is shared with the sliding-window algorithm and must be
+        -- checked before a bucket token is spent, exactly like the sliding-window script.
+        if globalKey ~= '' and globalLimit > 0 then
+            redis.call('ZREMRANGEBYSCORE', globalKey, '-inf', nowMs - windowMs)
+            if redis.call('ZCARD', globalKey) >= globalLimit then
+                local oldest = redis.call('ZRANGE', globalKey, 0, 0, 'WITHSCORES')
+                local reset = nowMs + windowMs
+                if oldest and #oldest >= 2 then reset = tonumber(oldest[2]) + windowMs end
+                if ttl > 0 then redis.call('EXPIRE', globalKey, ttl) end
+                return { 0, 0, reset }
+            end
         end
 
         local state = redis.call('HMGET', key, 'tokens', 'lastRefillMs')
@@ -380,6 +409,10 @@ public sealed partial class RedisQuotaStorage
 
         redis.call('HSET', key, 'tokens', tostring(tokens), 'lastRefillMs', lastRefill)
         if ttl > 0 then redis.call('EXPIRE', key, ttl) end
+        if allowed == 1 and globalKey ~= '' and globalLimit > 0 then
+            redis.call('ZADD', globalKey, nowMs, member)
+            if ttl > 0 then redis.call('EXPIRE', globalKey, ttl) end
+        end
         return { allowed, remaining, reset }
         """;
 }
