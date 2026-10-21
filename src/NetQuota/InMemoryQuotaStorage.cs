@@ -423,7 +423,7 @@ public sealed class InMemoryQuotaStorage(Func<DateTimeOffset>? clock = null)
         {
             if (!string.IsNullOrWhiteSpace(idempotencyKey))
             {
-                var idemKey = $"topup:{userId}:{resource}:{idempotencyKey}";
+                var idemKey = $"topup:{Uri.EscapeDataString(userId)}:{Uri.EscapeDataString(resource)}:{Uri.EscapeDataString(idempotencyKey)}";
                 if (_idempotency.TryGetValue(idemKey, out var cached) && cached.ExpiresAtUtc > nowUtc)
                 {
                     return Task.CompletedTask;
@@ -455,7 +455,7 @@ public sealed class InMemoryQuotaStorage(Func<DateTimeOffset>? clock = null)
         {
             if (!string.IsNullOrWhiteSpace(idempotencyKey))
             {
-                var idemKey = $"refund_credits:{userId}:{resource}:{idempotencyKey}";
+                var idemKey = $"refund_credits:{Uri.EscapeDataString(userId)}:{Uri.EscapeDataString(resource)}:{Uri.EscapeDataString(idempotencyKey)}";
                 if (_idempotency.TryGetValue(idemKey, out var cached) && cached.ExpiresAtUtc > nowUtc)
                 {
                     return Task.CompletedTask;
@@ -765,20 +765,22 @@ public sealed class InMemoryQuotaStorage(Func<DateTimeOffset>? clock = null)
         }
     }
 
-    private static string NormalizeConsumeIdemKey(string userId, string idempotencyKey)
-    {
-        var scoped = idempotencyKey.StartsWith($"{userId}:", StringComparison.Ordinal)
-            ? idempotencyKey
-            : $"{userId}:{idempotencyKey}";
-        return $"consume:{scoped}";
-    }
+    private static string NormalizeConsumeIdemKey(string userId, string idempotencyKey) =>
+        $"consume:{ScopeIdempotencyKey(userId, idempotencyKey)}";
 
-    private static string NormalizeRefundIdemKey(string userId, string idempotencyKey)
+    private static string NormalizeRefundIdemKey(string userId, string idempotencyKey) =>
+        $"refund:{ScopeIdempotencyKey(userId, idempotencyKey)}";
+
+    /// <summary>
+    /// Matches <see cref="QuotaManager.ScopedIdempotencyKey"/>: each segment is percent-encoded, so
+    /// ("a:b", "c") and ("a", "b:c") cannot share an idempotency record.
+    /// </summary>
+    private static string ScopeIdempotencyKey(string userId, string idempotencyKey)
     {
-        var scoped = idempotencyKey.StartsWith($"{userId}:", StringComparison.Ordinal)
+        var prefix = $"{Uri.EscapeDataString(userId)}:";
+        return idempotencyKey.StartsWith(prefix, StringComparison.Ordinal)
             ? idempotencyKey
-            : $"{userId}:{idempotencyKey}";
-        return $"refund:{scoped}";
+            : prefix + Uri.EscapeDataString(idempotencyKey);
     }
 
     private static string UsageKey(string userId, string resource, PeriodWindow window) =>

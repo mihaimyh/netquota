@@ -93,6 +93,35 @@ public class QuotaCreditIdempotencyTests
         Assert.Equal(5, (await manager.GetQuotaAsync("u1", Resource, PeriodType.Forever)).Limit);
     }
 
+    [Fact]
+    public async Task Consume_SameKeyForColonAmbiguousUsers_DoesNotReplayAcrossIdentities()
+    {
+        var manager = new QuotaManager(
+            new InMemoryQuotaStorage(),
+            new QuotaConfig
+            {
+                DefaultTier = "free",
+                Tiers = new Dictionary<string, TierConfig>(StringComparer.OrdinalIgnoreCase)
+                {
+                    ["free"] = new TierConfig
+                    {
+                        DailyQuotas = new Dictionary<string, int> { ["api"] = 10 }
+                    }
+                }
+            });
+
+        var first = await manager.ConsumeWithResultAsync(
+            "a:b", "api", 1, PeriodType.Daily, new ConsumeOptions(IdempotencyKey: "c"));
+        var second = await manager.ConsumeWithResultAsync(
+            "a", "api", 1, PeriodType.Daily, new ConsumeOptions(IdempotencyKey: "b:c"));
+
+        Assert.True(first.Allowed);
+        Assert.False(first.Replayed);
+        Assert.True(second.Allowed);
+        Assert.False(second.Replayed);
+        Assert.Equal(1, (await manager.GetQuotaAsync("a", "api", PeriodType.Daily)).Used);
+    }
+
     private static QuotaManager CreateManager() =>
         new(
             new InMemoryQuotaStorage(),
