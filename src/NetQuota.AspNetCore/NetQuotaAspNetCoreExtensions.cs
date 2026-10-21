@@ -64,6 +64,14 @@ public static class NetQuotaHttpHeaders
             context.Response.Headers[NetQuotaHeaderNames.RateLimitReset] =
                 reset.ToUnixTimeSeconds().ToString(CultureInfo.InvariantCulture);
         }
+
+        if (!result.Allowed && result.ResetAtUtc is { } retryReset)
+        {
+            // A quota denial carries Retry-After derived from the window reset, never less than 1 second.
+            var retrySeconds = Math.Max(1, (int)Math.Ceiling((retryReset - DateTimeOffset.UtcNow).TotalSeconds));
+            context.Response.Headers[NetQuotaHeaderNames.RetryAfter] =
+                retrySeconds.ToString(CultureInfo.InvariantCulture);
+        }
     }
 
     public static void ApplyWarningHeaders(HttpContext context, QuotaUsage usage, double threshold)
@@ -79,6 +87,9 @@ public static class NetQuotaHttpHeaders
 
 public static class NetQuotaAmountExtractors
 {
+    /// <summary>Upper bound applied to any client-supplied consume amount.</summary>
+    public const int MaximumAmount = 1_000_000;
+
     public static Func<HttpContext, ValueTask<int>> Fixed(int amount = 1)
     {
         ArgumentOutOfRangeException.ThrowIfLessThan(amount, 1);
@@ -93,7 +104,7 @@ public static class NetQuotaAmountExtractors
                 parsed >= 1)
             {
                 // Clamp client-supplied amounts so one request cannot consume an absurd budget.
-                return ValueTask.FromResult(Math.Min(parsed, 1_000_000));
+                return ValueTask.FromResult(Math.Min(parsed, MaximumAmount));
             }
 
             return ValueTask.FromResult(Math.Max(1, fallback));
@@ -113,42 +124,127 @@ public static class NetQuotaAmountExtractors
             return ValueTask.FromResult(Math.Max(Math.Max(1, minimumUnits), units));
         };
 
+    /// <summary>
+    /// Reads an integer amount from the JSON request body. Endpoint filters run after minimal-API
+    /// argument binding, so this extractor can only see the body when the endpoint does not declare a
+    /// body-bound parameter. When the body has already been consumed it fails closed with a
+    /// <see cref="NetQuotaAmountResolutionException"/> instead of silently charging the fallback;
+    /// use <see cref="FromBoundArgument{T}"/> with
+    /// <see cref="NetQuotaEnforcementOptions.ResolveAmountFromArgumentsAsync"/> on body-bound endpoints.
+    /// </summary>
     public static Func<HttpContext, ValueTask<int>> FromJsonBodyInt(string propertyName, int fallback = 1) =>
         async ctx =>
         {
             ctx.Request.EnableBuffering();
+            var body = ctx.Request.Body;
+            if (body.CanSeek)
+            {
+                body.Position = 0;
+            }
+
             try
             {
-                using var doc = await JsonDocument.ParseAsync(ctx.Request.Body, cancellationToken: ctx.RequestAborted);
+                if (body.CanSeek)
+                {
+                    var probe = new byte[1];
+                    var read = await body.ReadAsync(probe.AsMemory(), ctx.RequestAborted);
+                    body.Position = 0;
+                    if (read == 0)
+                    {
+                        if (ctx.Request.ContentLength is > 0)
+                        {
+                            throw BodyAlreadyConsumed(propertyName);
+                        }
+
+                        return Math.Max(1, fallback);
+                    }
+                }
+
+                using var doc = await JsonDocument.ParseAsync(body, cancellationToken: ctx.RequestAborted);
                 if (doc.RootElement.ValueKind == JsonValueKind.Object &&
                     doc.RootElement.TryGetProperty(propertyName, out var prop) &&
                     prop.TryGetInt32(out var val) &&
                     val >= 1)
                 {
-                    return val;
+                    // Clamp client-supplied amounts so one request cannot consume an absurd budget.
+                    return Math.Min(val, MaximumAmount);
                 }
+
+                return Math.Max(1, fallback);
             }
-            catch
+            catch (OperationCanceledException)
             {
-                // Ignore malformed JSON and return fallback
+                throw;
+            }
+            catch (JsonException ex)
+            {
+                throw new NetQuotaAmountResolutionException(
+                    $"The request body is not valid JSON while resolving amount property '{propertyName}'.",
+                    ex);
             }
             finally
             {
-                if (ctx.Request.Body.CanSeek)
+                if (body.CanSeek)
                 {
-                    ctx.Request.Body.Position = 0;
+                    body.Position = 0;
                 }
             }
-
-            return fallback;
         };
+
+    /// <summary>
+    /// Reads the amount from an argument the minimal API has already bound (for example a JSON body
+    /// parameter). Use it as <see cref="NetQuotaEnforcementOptions.ResolveAmountFromArgumentsAsync"/>
+    /// on endpoints that bind the request body, where <see cref="FromJsonBodyInt"/> cannot re-read it.
+    /// </summary>
+    public static Func<EndpointFilterInvocationContext, ValueTask<int>> FromBoundArgument<T>(
+        Func<T, int> selector,
+        int fallback = 1)
+    {
+        ArgumentNullException.ThrowIfNull(selector);
+
+        return ctx =>
+        {
+            if (ctx.Arguments.FirstOrDefault(argument => argument is T) is not T value)
+            {
+                throw new NetQuotaAmountResolutionException(
+                    $"The endpoint has no bound argument of type '{typeof(T).Name}' to resolve the consume amount from.");
+            }
+
+            var amount = selector(value);
+            return ValueTask.FromResult(amount >= 1 ? Math.Min(amount, MaximumAmount) : Math.Max(1, fallback));
+        };
+    }
+
+    private static NetQuotaAmountResolutionException BodyAlreadyConsumed(string propertyName) =>
+        new(
+            $"The request body has already been consumed, so amount property '{propertyName}' cannot be read. " +
+            "Endpoint filters run after minimal-API argument binding: when the endpoint declares a body-bound " +
+            "parameter the body stream is at EOF and cannot be rewound. Use " +
+            "NetQuotaAmountExtractors.FromBoundArgument<T> together with " +
+            "NetQuotaEnforcementOptions.ResolveAmountFromArgumentsAsync on body-bound endpoints. " +
+            "Refusing to charge the fallback amount silently.");
 }
+
+/// <summary>
+/// Raised when the consume amount for a request cannot be resolved from the source the endpoint
+/// configured (for example a JSON body that model binding already consumed).
+/// </summary>
+public sealed class NetQuotaAmountResolutionException(string message, Exception? innerException = null)
+    : Exception(message, innerException);
 
 public sealed record NetQuotaEnforcementOptions
 {
     public required Func<HttpContext, ValueTask<string?>> ResolveUserIdAsync { get; init; }
     public required Func<HttpContext, ValueTask<string>> ResolveResourceAsync { get; init; }
     public Func<HttpContext, ValueTask<int>> ResolveAmountAsync { get; init; } = NetQuotaAmountExtractors.Fixed(1);
+    /// <summary>
+    /// Amount resolver that can read arguments minimal APIs have already bound. Endpoint filters run
+    /// after argument binding, so on an endpoint that declares a JSON body parameter the request body
+    /// is already consumed and <see cref="NetQuotaAmountExtractors.FromJsonBodyInt"/> cannot re-read
+    /// it. Use <see cref="NetQuotaAmountExtractors.FromBoundArgument{T}"/> here for those endpoints.
+    /// When set, this takes precedence over <see cref="ResolveAmountAsync"/>.
+    /// </summary>
+    public Func<EndpointFilterInvocationContext, ValueTask<int>>? ResolveAmountFromArgumentsAsync { get; init; }
     /// <summary>
     /// Optional idempotency key for the consume call. The default is <c>null</c>: a header supplied
     /// by the caller is not a trust boundary, because a replayed consumption is reported as allowed
@@ -231,7 +327,24 @@ public static class NetQuotaServiceCollectionExtensions
             }
 
             var resource = await options.ResolveResourceAsync(httpContext);
-            var amount = await options.ResolveAmountAsync(httpContext);
+            int amount;
+            try
+            {
+                amount = options.ResolveAmountFromArgumentsAsync is not null
+                    ? await options.ResolveAmountFromArgumentsAsync(invocationContext)
+                    : await options.ResolveAmountAsync(httpContext);
+            }
+            catch (NetQuotaAmountResolutionException amountEx)
+            {
+                GetLogger(httpContext).LogError(
+                    amountEx,
+                    "NetQuota could not resolve the consume amount for user {UserId}.",
+                    userId);
+                return Results.Json(
+                    new { error = "quota_amount_unresolved", detail = amountEx.Message },
+                    statusCode: StatusCodes.Status500InternalServerError);
+            }
+
             var idempotencyKey = await options.ResolveIdempotencyKeyAsync(httpContext);
             var distinctKey = options.ResolveDistinctKeyAsync is not null
                 ? await options.ResolveDistinctKeyAsync(httpContext)
@@ -337,6 +450,7 @@ public static class NetQuotaServiceCollectionExtensions
             }
             catch (Exception ex)
             {
+                cancellationToken.ThrowIfCancellationRequested();
                 GetLogger(httpContext).LogError(ex, "NetQuota usage endpoint failed to read the entitlement for user {UserId}.", userId);
                 return Results.Json(
                     new { error = "quota_unavailable" },
@@ -422,6 +536,7 @@ public static class NetQuotaServiceCollectionExtensions
                 }
                 catch (Exception ex)
                 {
+                    cancellationToken.ThrowIfCancellationRequested();
                     firstError ??= ex;
                 }
             }

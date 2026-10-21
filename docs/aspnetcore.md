@@ -33,6 +33,13 @@ app.UseRateLimiter();
 The lease exposes `MetadataName.RetryAfter`; set `Retry-After` with
 `Math.Max(1, (int)Math.Ceiling(delay.TotalSeconds))` (sub-second delays must not become `0`).
 
+By default the limiter resolves the subject's entitlement and charges against its effective tier
+(promotions included), falling back to `QuotaConfig.DefaultTier`. Pass the optional fourth
+constructor argument to pin a tier explicitly. `AcquireAsync(permitCount)` charges one window slot
+per permit and grants the lease only when every permit fits; negative counts throw
+`ArgumentOutOfRangeException`. A multi-permit denial is not rolled back: permits charged before the
+denial stay consumed, so use permit counts above 1 only when over-charging on denial is acceptable.
+
 ## Endpoint filter
 
 ```csharp
@@ -51,12 +58,33 @@ app.MapPost("/v1/reports", Generate)
 ```
 
 Amount extractors: `Fixed`, `FromHeader` (clamped at 1,000,000), `FromJsonBodyInt`,
-`FromBodyByteLength`.
+`FromBodyByteLength`, and `FromBoundArgument<T>`.
+
+Endpoint filters run **after** minimal-API argument binding. On an endpoint that declares a body
+parameter (for example `MapPost("/reports", (ReportRequest body) => ...)`) the body has already been
+consumed when the filter runs, so `FromJsonBodyInt` cannot re-read it and fails with a 500
+`quota_amount_unresolved` instead of silently charging the fallback amount. The same fail-closed
+response is returned for malformed JSON. Use the bound argument instead:
+
+```csharp
+app.MapPost("/reports", (ReportRequest body) => Generate(body))
+   .WithNetQuota(new NetQuotaEnforcementOptions
+   {
+       ResolveUserIdAsync = ctx => ValueTask.FromResult(ctx.User.FindFirstValue(ClaimTypes.NameIdentifier)),
+       ResolveResourceAsync = _ => ValueTask.FromResult("reports"),
+       ResolveAmountFromArgumentsAsync =
+           NetQuotaAmountExtractors.FromBoundArgument<ReportRequest>(body => body.Units)
+   });
+```
+
+`FromJsonBodyInt` remains the right extractor for endpoints that only take `HttpContext` (and
+therefore never read the body). Both extractors reject non-positive JSON amounts by falling back to
+the configured fallback (at least 1) and clamp positive amounts at 1,000,000.
 
 Headers:
 
 - `X-RateLimit-Limit`, `X-RateLimit-Remaining`, `X-RateLimit-Reset` (unix seconds)
-- `Retry-After` on rejections (≥ 1 second)
+- `Retry-After` on rejections (≥ 1 second), including quota 429s derived from the window reset
 - `X-Quota-Warning-Threshold`, `X-Quota-Warning-Used`, `X-Quota-Warning-Limit` when a threshold is
   crossed during the request
 
