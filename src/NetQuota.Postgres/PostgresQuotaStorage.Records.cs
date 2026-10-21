@@ -57,7 +57,12 @@ public sealed partial class PostgresQuotaStorage
         IReadOnlyList<string> distinctKeys,
         CancellationToken cancellationToken)
     {
+        // The read path treats an expired record as absent, so the expired row must be replaced
+        // instead of colliding with the new one on the primary key (PGC-1).
         await using var command = Command(connection, tx, """
+            DELETE FROM netquota_consumption_records
+            WHERE idempotency_key = @key AND expires_at_utc <= @now;
+
             INSERT INTO netquota_consumption_records (
                 idempotency_key, user_id, resource, amount, period_type, period_key,
                 period_start_utc, period_end_utc, new_used, effective_limit, allowed,
@@ -97,7 +102,11 @@ public sealed partial class PostgresQuotaStorage
         TimeSpan idempotencyTtl,
         CancellationToken cancellationToken)
     {
+        // Same as the consumption record: an expired refund record is invisible to the read path.
         await using var command = Command(connection, tx, """
+            DELETE FROM netquota_refund_records
+            WHERE idempotency_key = @key AND expires_at_utc <= @now;
+
             INSERT INTO netquota_refund_records (
                 idempotency_key, user_id, resource, amount, period_type, period_key,
                 period_start_utc, period_end_utc, reason, timestamp_utc, expires_at_utc)
@@ -223,7 +232,9 @@ public sealed partial class PostgresQuotaStorage
             INSERT INTO netquota_credit_records (
                 idempotency_key, kind, user_id, resource, amount, timestamp_utc, expires_at_utc)
             VALUES (@key, @kind, @user, @resource, @amount, @now, @expires)
-            ON CONFLICT (idempotency_key) DO NOTHING
+            ON CONFLICT (idempotency_key) DO UPDATE SET
+                expires_at_utc = EXCLUDED.expires_at_utc,
+                timestamp_utc = EXCLUDED.timestamp_utc
             """,
             ("key", recordKey),
             ("kind", kind),
@@ -249,8 +260,36 @@ public sealed partial class PostgresQuotaStorage
         return new PeriodWindow(type, periodKey, start, end);
     }
 
-    private static string ScopedKey(string userId, string idempotencyKey) =>
-        idempotencyKey.StartsWith($"{userId}{RecordKeyPrefixSeparator}", StringComparison.Ordinal)
+    private static string ScopedKey(string userId, string idempotencyKey)
+    {
+        var scope = EscapeScope(userId);
+        return idempotencyKey.StartsWith($"{scope}{RecordKeyPrefixSeparator}", StringComparison.Ordinal)
             ? idempotencyKey
-            : $"{userId}{RecordKeyPrefixSeparator}{idempotencyKey}";
+            : $"{scope}{RecordKeyPrefixSeparator}{idempotencyKey}";
+    }
+
+    /// <summary>
+    /// A user id may contain the separator, so a plain concatenation is not injective:
+    /// (user="a:b", key="c") and (user="a", key="b:c") would share a record. Escaping keeps the
+    /// historical form for ordinary ids while making the scoped key unambiguous.
+    /// </summary>
+    private static string EscapeScope(string userId) =>
+        userId
+            .Replace("%", "%25", StringComparison.Ordinal)
+            .Replace(RecordKeyPrefixSeparator, "%3A", StringComparison.Ordinal);
+
+    private static void EnsureRecordOwnership(
+        string recordUserId,
+        string recordResource,
+        string userId,
+        string resource,
+        string scopedKey)
+    {
+        if (!string.Equals(recordUserId, userId, StringComparison.Ordinal) ||
+            !string.Equals(recordResource, resource, StringComparison.Ordinal))
+        {
+            throw new QuotaException(
+                $"Idempotency record '{scopedKey}' belongs to a different user or resource.");
+        }
+    }
 }

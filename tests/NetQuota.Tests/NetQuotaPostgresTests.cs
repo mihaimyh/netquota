@@ -409,6 +409,372 @@ public class NetQuotaPostgresTests
         Assert.False(zeroRate.Allowed);
     }
 
+    [Fact]
+    public async Task Consume_ReusingIdempotencyKeyAfterItsTtl_ReplacesTheExpiredRecord()
+    {
+        var maybeStorage = await CreateAsync();
+        Assert.SkipWhen(maybeStorage is null, PostgresNotConfigured);
+        var storage = maybeStorage!;
+
+        var userId = NewUser();
+        var now = DateTimeOffset.UtcNow;
+        var window = PeriodWindow.ForDaily(now, TimeZoneInfo.Utc);
+        var ttl = TimeSpan.FromMilliseconds(500);
+        var token = TestContext.Current.CancellationToken;
+
+        StorageConsumeSpec Spec(DateTimeOffset at) => new(
+            userId, "api_calls", 1, window, 10, "ttl_key", null, ttl, at, "free");
+
+        Assert.True((await storage.TryConsumeAsync(Spec(now), token)).Allowed);
+
+        // The key lapsed: this is a new charge, and it must not throw 23505 on the stale row.
+        var afterExpiry = await storage.TryConsumeAsync(Spec(now.AddSeconds(1)), token);
+        Assert.True(afterExpiry.Allowed);
+        Assert.False(afterExpiry.WasIdempotencyHit);
+        Assert.Equal(2, afterExpiry.NewUsed);
+
+        // The refreshed record now replays.
+        var immediateRetry = await storage.TryConsumeAsync(Spec(now.AddSeconds(1)), token);
+        Assert.True(immediateRetry.WasIdempotencyHit);
+        Assert.Equal(2, immediateRetry.NewUsed);
+    }
+
+    [Fact]
+    public async Task Refund_ReusingIdempotencyKeyAfterItsTtl_ReplacesTheExpiredRecord()
+    {
+        var maybeStorage = await CreateAsync();
+        Assert.SkipWhen(maybeStorage is null, PostgresNotConfigured);
+        var storage = maybeStorage!;
+
+        var userId = NewUser();
+        var now = DateTimeOffset.UtcNow;
+        var window = PeriodWindow.ForDaily(now, TimeZoneInfo.Utc);
+        var ttl = TimeSpan.FromMilliseconds(500);
+        var token = TestContext.Current.CancellationToken;
+
+        await storage.SetUsageAsync(userId, "consultare", window, used: 5, limit: 10, cancellationToken: token);
+
+        RefundRequest Request() => new(userId, "consultare", 1, PeriodType.Daily, IdempotencyKey: "refund_ttl");
+
+        var first = await storage.RefundAsync(Request(), window, 10, ttl, now, token);
+        Assert.False(first.Replayed);
+
+        var afterExpiry = await storage.RefundAsync(Request(), window, 10, ttl, now.AddSeconds(1), token);
+        Assert.False(afterExpiry.Replayed);
+        Assert.Equal(1, afterExpiry.Amount);
+
+        var immediateRetry = await storage.RefundAsync(Request(), window, 10, ttl, now.AddSeconds(1), token);
+        Assert.True(immediateRetry.Replayed);
+        Assert.Equal(0, immediateRetry.Amount);
+
+        var usage = await storage.GetUsageAsync(userId, "consultare", window, 10, token);
+        Assert.Equal(3, usage!.Used);
+    }
+
+    [Fact]
+    public async Task Consume_PersistsWindowBounds_SoPruneDeletesConsumedRows()
+    {
+        var maybeStorage = await CreateAsync();
+        Assert.SkipWhen(maybeStorage is null, PostgresNotConfigured);
+        var storage = maybeStorage!;
+
+        var userId = NewUser();
+        var windowStart = new DateTimeOffset(2020, 1, 1, 0, 0, 0, TimeSpan.Zero);
+        var window = PeriodWindow.ForDaily(windowStart, TimeZoneInfo.Utc);
+        var token = TestContext.Current.CancellationToken;
+
+        var outcome = await storage.TryConsumeAsync(new StorageConsumeSpec(
+            userId, "api_calls", 1, window, 10, "consume_1", "doc-1", TimeSpan.FromHours(1),
+            windowStart.AddHours(10), "free"), token);
+        Assert.True(outcome.Allowed);
+
+        var pruned = await storage.PruneExpiredAsync(windowStart.AddDays(30), token);
+        Assert.True(pruned >= 1, $"pruned={pruned}");
+
+        var usage = await storage.GetUsageAsync(userId, "api_calls", window, 10, token);
+        Assert.Equal(0, usage!.Used);
+        Assert.Empty(usage.DistinctKeys);
+    }
+
+    [Fact]
+    public async Task Consume_UserIdsContainingSeparator_DoNotShareIdempotencyRecords()
+    {
+        var maybeStorage = await CreateAsync();
+        Assert.SkipWhen(maybeStorage is null, PostgresNotConfigured);
+        var storage = maybeStorage!;
+
+        var suffix = Guid.NewGuid().ToString("N");
+        var scopedUser = $"acme:{suffix}";
+        var plainUser = "acme";
+        var resource = $"api_{suffix}";
+        var now = DateTimeOffset.UtcNow;
+        var window = PeriodWindow.ForDaily(now, TimeZoneInfo.Utc);
+        var ttl = TimeSpan.FromHours(1);
+        var token = TestContext.Current.CancellationToken;
+
+        var first = await storage.TryConsumeAsync(new StorageConsumeSpec(
+            scopedUser, resource, 1, window, 10, "order-1", null, ttl, now, "free"), token);
+        Assert.True(first.Allowed);
+        Assert.False(first.WasIdempotencyHit);
+
+        // ("acme:<id>", "order-1") and ("acme", "<id>:order-1") used to map to the same record.
+        var second = await storage.TryConsumeAsync(new StorageConsumeSpec(
+            plainUser, resource, 1, window, 10, $"{suffix}:order-1", null, ttl, now, "free"), token);
+        Assert.True(second.Allowed);
+        Assert.False(second.WasIdempotencyHit);
+        Assert.Equal(1, second.NewUsed);
+
+        var secondUsage = await storage.GetUsageAsync(plainUser, resource, window, 10, token);
+        Assert.Equal(1, secondUsage!.Used);
+
+        var firstUsage = await storage.GetUsageAsync(scopedUser, resource, window, 10, token);
+        Assert.Equal(1, firstUsage!.Used);
+    }
+
+    [Fact]
+    public async Task TopUp_ReusingCreditKeyAfterItsTtl_RefreshesTheRecordInsteadOfGrantingAgain()
+    {
+        var maybeStorage = await CreateAsync();
+        Assert.SkipWhen(maybeStorage is null, PostgresNotConfigured);
+        var storage = maybeStorage!;
+
+        var userId = NewUser();
+        var now = DateTimeOffset.UtcNow;
+        var ttl = TimeSpan.FromMilliseconds(500);
+        var token = TestContext.Current.CancellationToken;
+
+        await storage.TopUpForeverCreditsAsync(userId, "credits", 10, "topup_ttl", ttl, now, token);
+        await storage.TopUpForeverCreditsAsync(userId, "credits", 10, "topup_ttl", ttl, now.AddSeconds(1), token);
+
+        // Immediate retry after the refreshed grant must be treated as a replay.
+        await storage.TopUpForeverCreditsAsync(userId, "credits", 10, "topup_ttl", ttl, now.AddSeconds(1), token);
+
+        var usage = await storage.GetUsageAsync(userId, "credits", PeriodWindow.Forever, 0, token);
+        Assert.Equal(20, usage!.Limit);
+    }
+
+    [Fact]
+    public async Task RefundCredits_ReusingCreditKeyAfterItsTtl_RefreshesTheRecordInsteadOfDebitingAgain()
+    {
+        var maybeStorage = await CreateAsync();
+        Assert.SkipWhen(maybeStorage is null, PostgresNotConfigured);
+        var storage = maybeStorage!;
+
+        var userId = NewUser();
+        var now = DateTimeOffset.UtcNow;
+        var ttl = TimeSpan.FromMilliseconds(500);
+        var token = TestContext.Current.CancellationToken;
+
+        await storage.TopUpForeverCreditsAsync(userId, "credits", 20, null, TimeSpan.FromHours(1), now, token);
+        await storage.RefundForeverCreditsAsync(userId, "credits", 5, "refund_ttl", ttl, now, token);
+        await storage.RefundForeverCreditsAsync(userId, "credits", 5, "refund_ttl", ttl, now.AddSeconds(1), token);
+
+        await storage.RefundForeverCreditsAsync(userId, "credits", 5, "refund_ttl", ttl, now.AddSeconds(1), token);
+
+        var usage = await storage.GetUsageAsync(userId, "credits", PeriodWindow.Forever, 0, token);
+        Assert.Equal(10, usage!.Limit);
+    }
+
+    [Fact]
+    public async Task SetUsage_WithoutDistinctKeys_KeepsTheStoredKeys()
+    {
+        var maybeStorage = await CreateAsync();
+        Assert.SkipWhen(maybeStorage is null, PostgresNotConfigured);
+        var storage = maybeStorage!;
+
+        var userId = NewUser();
+        var now = DateTimeOffset.UtcNow;
+        var window = PeriodWindow.ForDaily(now, TimeZoneInfo.Utc);
+        var token = TestContext.Current.CancellationToken;
+
+        foreach (var distinct in new[] { "b", "a" })
+        {
+            await storage.TryConsumeAsync(new StorageConsumeSpec(
+                userId, "api_calls", 1, window, 10, null, distinct, TimeSpan.FromHours(1), now, "free"), token);
+        }
+
+        await storage.SetUsageAsync(userId, "api_calls", window, used: 2, limit: 10, cancellationToken: token);
+
+        var preserved = await storage.GetUsageAsync(userId, "api_calls", window, 10, token);
+        Assert.Equal(2, preserved!.Used);
+        Assert.Equal(["a", "b"], preserved.DistinctKeys);
+
+        // Resetting the usage to zero still clears the dedupe set.
+        await storage.SetUsageAsync(userId, "api_calls", window, used: 0, limit: 10, cancellationToken: token);
+
+        var reset = await storage.GetUsageAsync(userId, "api_calls", window, 10, token);
+        Assert.Empty(reset!.DistinctKeys);
+    }
+
+    [Fact]
+    public async Task Merge_ReusingAKeyForADifferentUserPair_ThrowsInsteadOfReportingAlreadyMerged()
+    {
+        var maybeStorage = await CreateAsync();
+        Assert.SkipWhen(maybeStorage is null, PostgresNotConfigured);
+        var storage = maybeStorage!;
+
+        var source = NewUser();
+        var target = NewUser();
+        var otherSource = NewUser();
+        var otherTarget = NewUser();
+        var now = DateTimeOffset.UtcNow;
+        var daily = PeriodWindow.ForDaily(now, TimeZoneInfo.Utc);
+        var token = TestContext.Current.CancellationToken;
+
+        foreach (var (user, amount) in new[] { (source, 2), (otherSource, 3) })
+        {
+            await storage.TryConsumeAsync(new StorageConsumeSpec(
+                user, "consultare", amount, daily, 10, null, null, TimeSpan.FromHours(1), now, "free"), token);
+        }
+
+        StorageMergeRequest Request(string from, string to, string key) => new(
+            SourceUserId: from,
+            TargetUserId: to,
+            Items: [new MergeItem("consultare", PeriodType.Daily, daily, daily)],
+            IdempotencyKey: key,
+            SealSource: false,
+            NowUtc: now);
+
+        // The record is global, so the key must be unique per run against a shared database.
+        var sharedKey = $"merge_shared_{Guid.NewGuid():N}";
+
+        var merged = await storage.MergeUserAsync(Request(source, target, sharedKey), token);
+        Assert.False(merged.AlreadyMerged);
+
+        await Assert.ThrowsAsync<QuotaException>(() =>
+            storage.MergeUserAsync(Request(otherSource, otherTarget, sharedKey), token));
+
+        var untouched = await storage.GetUsageAsync(otherTarget, "consultare", daily, 10, token);
+        Assert.Equal(0, untouched!.Used);
+        Assert.False(await storage.IsUserSealedAsync(otherSource, now, token));
+
+        // The same pair still replays.
+        var replay = await storage.MergeUserAsync(Request(source, target, sharedKey), token);
+        Assert.True(replay.AlreadyMerged);
+    }
+
+    [Fact]
+    public async Task Merge_WithoutSeal_DoesNotReportADroppedPromotion()
+    {
+        var maybeStorage = await CreateAsync();
+        Assert.SkipWhen(maybeStorage is null, PostgresNotConfigured);
+        var storage = maybeStorage!;
+
+        var source = NewUser();
+        var target = NewUser();
+        var now = DateTimeOffset.UtcNow;
+        var daily = PeriodWindow.ForDaily(now, TimeZoneInfo.Utc);
+        var token = TestContext.Current.CancellationToken;
+
+        await storage.TryConsumeAsync(new StorageConsumeSpec(
+            source, "consultare", 1, daily, 10, null, null, TimeSpan.FromHours(1), now, "free"), token);
+        await storage.SetEntitlementAsync(new QuotaEntitlement(source, "free", now, now), token);
+        await storage.SetPromotionAsync(
+            source, new TierPromotion("pro", now, now.AddDays(2), Source: "test", Reason: "comp"), token);
+
+        var merged = await storage.MergeUserAsync(
+            new StorageMergeRequest(
+                SourceUserId: source,
+                TargetUserId: target,
+                Items: [new MergeItem("consultare", PeriodType.Daily, daily, daily)],
+                IdempotencyKey: $"merge:{source}",
+                SealSource: false,
+                NowUtc: now),
+            token);
+
+        Assert.Null(merged.DroppedPromotion);
+        Assert.Equal("pro", (await storage.GetEntitlementAsync(source, token))!.Promotion?.Tier);
+    }
+
+    [Fact]
+    public async Task Merge_ExpiredPromotion_IsNotReportedAsDropped()
+    {
+        var maybeStorage = await CreateAsync();
+        Assert.SkipWhen(maybeStorage is null, PostgresNotConfigured);
+        var storage = maybeStorage!;
+
+        var source = NewUser();
+        var target = NewUser();
+        var now = DateTimeOffset.UtcNow;
+        var daily = PeriodWindow.ForDaily(now, TimeZoneInfo.Utc);
+        var token = TestContext.Current.CancellationToken;
+
+        await storage.TryConsumeAsync(new StorageConsumeSpec(
+            source, "consultare", 1, daily, 10, null, null, TimeSpan.FromHours(1), now, "free"), token);
+        await storage.SetEntitlementAsync(new QuotaEntitlement(source, "free", now, now), token);
+        await storage.SetPromotionAsync(
+            source, new TierPromotion("pro", now.AddDays(-3), now.AddMinutes(-1), Source: "test", Reason: "old"), token);
+
+        var merged = await storage.MergeUserAsync(
+            new StorageMergeRequest(
+                SourceUserId: source,
+                TargetUserId: target,
+                Items: [new MergeItem("consultare", PeriodType.Daily, daily, daily)],
+                IdempotencyKey: $"merge:{source}",
+                SealSource: true,
+                NowUtc: now,
+                SealExpiresAtUtc: now.AddDays(30)),
+            token);
+
+        Assert.Null(merged.DroppedPromotion);
+    }
+
+    [Fact]
+    public async Task AuditEntriesWithEqualTimestamps_ReturnTheNewestRows()
+    {
+        var maybeStorage = await CreateAsync();
+        Assert.SkipWhen(maybeStorage is null, PostgresNotConfigured);
+        var storage = maybeStorage!;
+
+        var userId = NewUser();
+        var timestamp = new DateTimeOffset(2021, 5, 1, 12, 0, 0, TimeSpan.Zero);
+        var token = TestContext.Current.CancellationToken;
+
+        for (var i = 0; i < 20; i++)
+        {
+            await storage.LogAuditEntryAsync(
+                new AuditLogEntry(userId, "api_calls", "consume", i, timestamp, "tester", $"entry-{i}"), token);
+        }
+
+        var page = await storage.GetAuditLogsAsync(new AuditLogFilter(UserId: userId, Limit: 5), token);
+
+        Assert.Equal(new[] { 19, 18, 17, 16, 15 }, page.Select(entry => entry.Amount).ToArray());
+    }
+
+    [Fact]
+    public async Task Merge_PreservesTargetUsage_WhenAmountsExceedTheDistinctKeyCount()
+    {
+        var maybeStorage = await CreateAsync();
+        Assert.SkipWhen(maybeStorage is null, PostgresNotConfigured);
+        var storage = maybeStorage!;
+
+        var source = NewUser();
+        var target = NewUser();
+        var now = DateTimeOffset.UtcNow;
+        var daily = PeriodWindow.ForDaily(now, TimeZoneInfo.Utc);
+        var token = TestContext.Current.CancellationToken;
+
+        // Five units charged under one key: the key count is not the used-unit count.
+        await storage.TryConsumeAsync(new StorageConsumeSpec(
+            target, "consultare", 5, daily, 100, null, "doc-1", TimeSpan.FromHours(1), now, "free"), token);
+        await storage.TryConsumeAsync(new StorageConsumeSpec(
+            source, "consultare", 1, daily, 100, null, "doc-2", TimeSpan.FromHours(1), now, "free"), token);
+
+        var merged = await storage.MergeUserAsync(
+            new StorageMergeRequest(
+                SourceUserId: source,
+                TargetUserId: target,
+                Items: [new MergeItem("consultare", PeriodType.Daily, daily, daily)],
+                IdempotencyKey: $"merge:{source}",
+                SealSource: false,
+                NowUtc: now),
+            token);
+
+        Assert.Equal(6, (await storage.GetUsageAsync(target, "consultare", daily, 100, token))!.Used);
+        Assert.Equal(1, merged.TransferredUsage["consultare:Daily"]);
+        Assert.Equal(["doc-1", "doc-2"], (await storage.GetUsageAsync(target, "consultare", daily, 100, token))!.DistinctKeys);
+    }
+
     private static string NewUser() => $"test_{Guid.NewGuid():N}";
 
     private static async Task<PostgresQuotaStorage?> CreateAsync()
