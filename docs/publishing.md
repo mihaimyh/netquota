@@ -51,8 +51,9 @@ API keys still work for local publishing:
 ```powershell
 $env:NUGET_API_KEY = '<key>'
 dotnet pack NetQuota.slnx -c Release -o artifacts/packages -p:Version=1.2.3
-dotnet nuget push "artifacts/packages/*.nupkg" --api-key $env:NUGET_API_KEY --source https://api.nuget.org/v3/index.json --skip-duplicate
-dotnet nuget push "artifacts/packages/*.snupkg" --api-key $env:NUGET_API_KEY --source https://api.nuget.org/v3/index.json --skip-duplicate
+Get-ChildItem artifacts/packages/*.nupkg, artifacts/packages/*.snupkg | ForEach-Object {
+    dotnet nuget push $_.FullName --api-key $env:NUGET_API_KEY --source https://api.nuget.org/v3/index.json --skip-duplicate
+}
 ```
 
 ## Local build

@@ -67,15 +67,24 @@ jobs:
           user: ${{ secrets.NUGET_USER }}
 
       - name: Push packages to nuget.org
+        shell: bash
         run: |
-          dotnet nuget push "artifacts/packages/*.nupkg" \
-            --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" \
-            --source https://api.nuget.org/v3/index.json \
-            --skip-duplicate
-          dotnet nuget push "artifacts/packages/*.snupkg" \
-            --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" \
-            --source https://api.nuget.org/v3/index.json \
-            --skip-duplicate
+          set -euo pipefail
+          shopt -s nullglob
+          # Expand the globs here: `dotnet nuget push` does not expand a path
+          # wildcard, and bash does not expand a quoted one.
+          packages=(artifacts/packages/*.nupkg artifacts/packages/*.snupkg)
+          if [ "${#packages[@]}" -eq 0 ]; then
+            echo "No .nupkg/.snupkg files found in artifacts/packages" >&2
+            exit 1
+          fi
+          for package in "${packages[@]}"; do
+            echo "Pushing ${package}"
+            dotnet nuget push "${package}" \
+              --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" \
+              --source https://api.nuget.org/v3/index.json \
+              --skip-duplicate
+          done
 
       - name: Upload packages
         uses: actions/upload-artifact@v4
