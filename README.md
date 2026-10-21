@@ -18,7 +18,7 @@ the production bugs found in the original library (see `docs/adapters.md`).
 | `NetQuota.AspNetCore` | Rate limiter bridge, endpoint filter, `/usage` endpoint, headers |
 | `NetQuota.Billing` | Stripe and RevenueCat webhooks, checkout, transfers, reconciliation |
 
-All packages target `net11.0`.
+All packages target `net10.0` (LTS until November 2028).
 
 ## Quick start
 

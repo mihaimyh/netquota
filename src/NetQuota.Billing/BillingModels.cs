@@ -1,3 +1,6 @@
+using System.Net;
+using System.Text.Json;
+
 namespace NetQuota.Billing;
 
 public static class BillingPeriods
@@ -172,3 +175,172 @@ public sealed class BillingSignatureException(string message) : Exception(messag
 
 /// <summary>Malformed (empty or oversized) webhook payload; map it to 400/413 at the edge.</summary>
 public sealed class BillingPayloadException(string message) : Exception(message);
+
+/// <summary>
+/// Non-success HTTP response from a billing provider's REST API. Inherits <see cref="HttpRequestException"/>
+/// so callers catching transport failures continue to work, while exposing the structured provider
+/// error (<see cref="ErrorCode"/>, <see cref="ErrorMessage"/>, <see cref="RequestId"/>).
+/// </summary>
+public sealed class BillingProviderException : HttpRequestException
+{
+    public string Provider { get; }
+    public string? ErrorCode { get; }
+    public string? ErrorMessage { get; }
+    public string? RequestId { get; }
+    public string? ResponseBody { get; }
+
+    public BillingProviderException(
+        string provider,
+        HttpStatusCode statusCode,
+        string? errorCode = null,
+        string? errorMessage = null,
+        string? requestId = null,
+        string? responseBody = null,
+        Exception? inner = null)
+        : base(FormatMessage(provider, statusCode, errorCode, errorMessage, requestId), inner, statusCode)
+    {
+        Provider = provider;
+        ErrorCode = errorCode;
+        ErrorMessage = errorMessage;
+        RequestId = requestId;
+        ResponseBody = responseBody;
+    }
+
+    private static string FormatMessage(
+        string provider,
+        HttpStatusCode statusCode,
+        string? code,
+        string? message,
+        string? requestId)
+    {
+        var details = (code, message) switch
+        {
+            ({ Length: > 0 }, { Length: > 0 }) => $"{code}: {message}",
+            ({ Length: > 0 }, _) => code,
+            (_, { Length: > 0 }) => message,
+            _ => "HTTP error"
+        };
+
+        var reqPart = string.IsNullOrWhiteSpace(requestId) ? string.Empty : $" (request_id={requestId})";
+        return $"{provider} API returned {(int)statusCode} ({statusCode}): {details}{reqPart}";
+    }
+}
+
+/// <summary>
+/// Shared entitlement helpers that enforce NetQuota's billing invariants across providers:
+/// Invariant #1 (preserve <c>Promotion</c>, <c>Timezone</c>, <c>Sealed</c>, <c>MigratedTo</c>,
+/// <c>SealExpiresAtUtc</c> on every rewrite) and timestamp ordering (strictly older events lose;
+/// equal timestamps apply).
+/// </summary>
+public static class BillingEntitlementTransition
+{
+    /// <summary>
+    /// Returns <c>true</c> when <paramref name="eventTimestamp"/> is strictly older than the stored
+    /// entitlement's <see cref="QuotaEntitlement.UpdatedAtUtc"/>. Equal timestamps are not stale.
+    /// </summary>
+    public static bool IsStale(QuotaEntitlement? existing, DateTimeOffset eventTimestamp) =>
+        existing is not null && eventTimestamp != default && eventTimestamp < existing.UpdatedAtUtc;
+
+    /// <summary>
+    /// Builds a new <see cref="QuotaEntitlement"/> while preserving promotion, timezone and seal
+    /// metadata from <paramref name="existing"/> (Invariant #1).
+    /// </summary>
+    public static QuotaEntitlement Merge(
+        string userId,
+        string tier,
+        QuotaEntitlement? existing,
+        DateTimeOffset updatedAtUtc,
+        DateTimeOffset? subscriptionStartDateUtc = null,
+        DateTimeOffset? expiresAtUtc = null,
+        bool preserveExistingExpiry = true,
+        string? timezoneOverride = null) =>
+        new(
+            UserId: userId,
+            Tier: tier,
+            SubscriptionStartDateUtc: subscriptionStartDateUtc ?? existing?.SubscriptionStartDateUtc ?? updatedAtUtc,
+            UpdatedAtUtc: updatedAtUtc,
+            ExpiresAtUtc: expiresAtUtc ?? (preserveExistingExpiry ? existing?.ExpiresAtUtc : null),
+            Promotion: existing?.Promotion,
+            Timezone: timezoneOverride ?? existing?.Timezone,
+            Sealed: existing?.Sealed ?? false,
+            MigratedTo: existing?.MigratedTo,
+            SealExpiresAtUtc: existing?.SealExpiresAtUtc);
+}
+
+internal static class BillingHttpResponse
+{
+    public static async Task<JsonDocument> ReadJsonOrThrowAsync(
+        HttpResponseMessage response,
+        string provider,
+        CancellationToken cancellationToken)
+    {
+        var body = await response.Content.ReadAsStringAsync(cancellationToken);
+        if (!response.IsSuccessStatusCode)
+        {
+            throw CreateException(response, provider, body);
+        }
+
+        return JsonDocument.Parse(body);
+    }
+
+    private static BillingProviderException CreateException(
+        HttpResponseMessage response,
+        string provider,
+        string? body)
+    {
+        var requestId = TryGetHeader(response, "Request-Id")
+                        ?? TryGetHeader(response, "X-Request-Id");
+        string? code = null;
+        string? message = null;
+
+        if (!string.IsNullOrWhiteSpace(body))
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(body);
+                var root = doc.RootElement;
+                if (root.ValueKind == JsonValueKind.Object)
+                {
+                    // Stripe nests under { "error": { "code", "type", "message" } };
+                    // RevenueCat v1/v2 puts { "code"/"type", "message" } at the root.
+                    var source = root.TryGetProperty("error", out var err) && err.ValueKind == JsonValueKind.Object
+                        ? err
+                        : root;
+
+                    code = ReadStringOrNumber(source, "code") ?? ReadStringOrNumber(source, "type");
+                    message = ReadStringOrNumber(source, "message");
+                }
+            }
+            catch (JsonException)
+            {
+                // Non-JSON error body (e.g. upstream 502 HTML); keep raw body on the exception.
+            }
+        }
+
+        return new BillingProviderException(
+            provider,
+            response.StatusCode,
+            code,
+            message,
+            requestId,
+            body);
+    }
+
+    private static string? TryGetHeader(HttpResponseMessage response, string name) =>
+        response.Headers.TryGetValues(name, out var values) ? values.FirstOrDefault() : null;
+
+    private static string? ReadStringOrNumber(JsonElement element, string property)
+    {
+        if (!element.TryGetProperty(property, out var value))
+        {
+            return null;
+        }
+
+        return value.ValueKind switch
+        {
+            JsonValueKind.String => value.GetString(),
+            JsonValueKind.Number => value.GetRawText(),
+            _ => null
+        };
+    }
+}
