@@ -10,6 +10,7 @@ public sealed class LocalRateLimitEngine
         public long LastRefillTicks;
         public long LastSeenTicks;
         public long WindowTicks;
+        public long FullRefillTicks;
     }
 
     private sealed class SlidingWindowState
@@ -46,7 +47,7 @@ public sealed class LocalRateLimitEngine
 
             if (config.GlobalLimit > 0)
             {
-                var globalState = _globalSlidingWindows.GetOrAdd(resource, _ => new SlidingWindowState());
+                var globalState = GetGlobalWindow(resource, windowTicks, config.GlobalLimit);
                 globalState.WindowTicks = windowTicks;
                 globalState.LastSeenTicks = nowTicks;
                 var cutoff = nowTicks - windowTicks;
@@ -72,7 +73,7 @@ public sealed class LocalRateLimitEngine
 
             if (result.Allowed && config.GlobalLimit > 0)
             {
-                var globalState = _globalSlidingWindows.GetOrAdd(resource, _ => new SlidingWindowState());
+                var globalState = GetGlobalWindow(resource, windowTicks, config.GlobalLimit);
                 globalState.WindowTicks = windowTicks;
                 globalState.LastSeenTicks = nowTicks;
                 globalState.Queue.Enqueue(nowTicks);
@@ -117,7 +118,8 @@ public sealed class LocalRateLimitEngine
                 Tokens = capacity,
                 LastRefillTicks = nowTicks,
                 LastSeenTicks = nowTicks,
-                WindowTicks = windowTicks
+                WindowTicks = windowTicks,
+                FullRefillTicks = ComputeFullRefillTicks(capacity, refillPerSecond)
             };
             _buckets[key] = state;
         }
@@ -128,6 +130,7 @@ public sealed class LocalRateLimitEngine
             state.LastRefillTicks = nowTicks;
             state.LastSeenTicks = nowTicks;
             state.WindowTicks = windowTicks;
+            state.FullRefillTicks = ComputeFullRefillTicks(capacity, refillPerSecond);
         }
 
         if (state.Tokens >= 1.0)
@@ -219,13 +222,34 @@ public sealed class LocalRateLimitEngine
         }
     }
 
+    private SlidingWindowState GetGlobalWindow(string resource, long windowTicks, int globalLimit)
+    {
+        // The global budget belongs to a (resource, window, limit) configuration: one tier's shorter
+        // window must not prune another tier's exhausted budget for the same resource.
+        var globalKey = $"{resource}|{windowTicks}|{globalLimit}";
+        return _globalSlidingWindows.GetOrAdd(globalKey, _ => new SlidingWindowState());
+    }
+
+    private static long ComputeFullRefillTicks(int capacity, double refillPerSecond)
+    {
+        if (refillPerSecond <= 0)
+        {
+            return 0;
+        }
+
+        var ticks = capacity / refillPerSecond * TimeSpan.TicksPerSecond;
+        return ticks >= long.MaxValue ? long.MaxValue : (long)ticks;
+    }
+
     private void SweepIdleKeys(long nowTicks)
     {
         var minTtlTicks = TimeSpan.FromMinutes(10).Ticks;
 
         foreach (var (k, b) in _buckets)
         {
-            var idleWindow = Math.Max(b.WindowTicks * 2, minTtlTicks);
+            // Keep a bucket until it would have refilled completely. A bucket that is dropped earlier
+            // is recreated full and grants a free burst when Burst > 2 * Rate.
+            var idleWindow = Math.Max(Math.Max(b.WindowTicks * 2, b.FullRefillTicks), minTtlTicks);
             if (nowTicks - b.LastSeenTicks > idleWindow)
             {
                 _buckets.TryRemove(k, out _);
