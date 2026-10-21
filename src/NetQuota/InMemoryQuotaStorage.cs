@@ -73,6 +73,11 @@ public sealed class InMemoryQuotaStorage(Func<DateTimeOffset>? clock = null)
                     entitlement = entitlement with { Promotion = promo };
                 }
 
+                if (string.IsNullOrWhiteSpace(entitlement.Timezone) && !string.IsNullOrWhiteSpace(existing.Timezone))
+                {
+                    entitlement = entitlement with { Timezone = existing.Timezone };
+                }
+
                 if (!entitlement.Sealed && existing.Sealed)
                 {
                     entitlement = entitlement with

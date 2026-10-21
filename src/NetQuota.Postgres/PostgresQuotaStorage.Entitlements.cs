@@ -74,7 +74,7 @@ public sealed partial class PostgresQuotaStorage
                 subscription_start_date_utc = EXCLUDED.subscription_start_date_utc,
                 updated_at_utc = EXCLUDED.updated_at_utc,
                 expires_at_utc = EXCLUDED.expires_at_utc,
-                timezone = EXCLUDED.timezone,
+                timezone = COALESCE(NULLIF(EXCLUDED.timezone, ''), netquota_entitlements.timezone),
                 sealed = CASE WHEN EXCLUDED.sealed THEN true ELSE netquota_entitlements.sealed END,
                 migrated_to = CASE WHEN netquota_entitlements.sealed THEN netquota_entitlements.migrated_to
                                    ELSE EXCLUDED.migrated_to END,

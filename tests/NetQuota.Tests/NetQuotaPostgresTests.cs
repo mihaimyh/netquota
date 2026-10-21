@@ -57,6 +57,26 @@ public class NetQuotaPostgresTests
     }
 
     [Fact]
+    public async Task Entitlement_RewriteWithoutTimezone_PreservesStoredTimezone()
+    {
+        var maybeStorage = await CreateAsync();
+        Assert.SkipWhen(maybeStorage is null, PostgresNotConfigured);
+        var storage = maybeStorage!;
+
+        var userId = NewUser();
+        var now = DateTimeOffset.UtcNow;
+
+        await storage.SetEntitlementAsync(
+            new QuotaEntitlement(userId, "free", now, now, Timezone: "Europe/Bucharest"));
+        await storage.SetEntitlementAsync(
+            new QuotaEntitlement(userId, "pro", now, now.AddMinutes(1)));
+
+        var stored = await storage.GetEntitlementAsync(userId);
+        Assert.Equal("Europe/Bucharest", stored!.Timezone);
+        Assert.Equal("pro", stored.Tier);
+    }
+
+    [Fact]
     public async Task Consume_IsIdempotent_PreservesProratedLimit_AndRecordsForeverPeriod()
     {
         var maybeStorage = await CreateAsync();

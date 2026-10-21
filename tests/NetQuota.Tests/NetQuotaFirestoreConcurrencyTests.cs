@@ -188,6 +188,28 @@ public class NetQuotaFirestoreConcurrencyTests
     }
 
     [Fact]
+    public async Task Entitlement_RewriteWithoutTimezone_PreservesStoredTimezone()
+    {
+        var maybeDb = TryCreateEmulatorDb();
+        Assert.SkipWhen(maybeDb is null, FirestoreNotConfigured);
+        var db = maybeDb!;
+
+        var storage = new FirestoreQuotaStorage(db);
+        var userId = $"u_{Guid.NewGuid():N}";
+        var now = DateTimeOffset.UtcNow;
+        var ct = TestContext.Current.CancellationToken;
+
+        await storage.SetEntitlementAsync(
+            new QuotaEntitlement(userId, "free", now, now, Timezone: "Europe/Bucharest"), ct);
+        await storage.SetEntitlementAsync(
+            new QuotaEntitlement(userId, "pro", now, now.AddMinutes(1)), ct);
+
+        var stored = await storage.GetEntitlementAsync(userId, ct);
+        Assert.Equal("Europe/Bucharest", stored!.Timezone);
+        Assert.Equal("pro", stored.Tier);
+    }
+
+    [Fact]
     public async Task Idempotency_UsesHashedDocIds_AndRoundTripsForeverPeriod()
     {
         var maybeDb = TryCreateEmulatorDb();

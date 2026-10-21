@@ -96,6 +96,11 @@ public sealed class FirestoreQuotaStorage(
                     effective = effective with { Promotion = promo };
                 }
 
+                if (string.IsNullOrWhiteSpace(effective.Timezone) && !string.IsNullOrWhiteSpace(existing.Timezone))
+                {
+                    effective = effective with { Timezone = existing.Timezone };
+                }
+
                 if (!effective.Sealed && existing.Sealed)
                 {
                     effective = effective with

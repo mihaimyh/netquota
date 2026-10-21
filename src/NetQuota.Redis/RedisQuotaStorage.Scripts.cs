@@ -215,8 +215,7 @@ public sealed partial class RedisQuotaStorage
         if ARGV[5] ~= '' then redis.call('HSET', key, 'expiresAtUtc', ARGV[5])
         else redis.call('HDEL', key, 'expiresAtUtc') end
 
-        if ARGV[6] ~= '' then redis.call('HSET', key, 'timezone', ARGV[6])
-        else redis.call('HDEL', key, 'timezone') end
+        if ARGV[6] ~= '' then redis.call('HSET', key, 'timezone', ARGV[6]) end
 
         -- Keep a merge tombstone while the account is still sealed.
         if ARGV[8] ~= '' then redis.call('HSET', key, 'migratedTo', ARGV[8])

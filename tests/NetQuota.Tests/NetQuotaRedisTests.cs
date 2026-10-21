@@ -192,6 +192,29 @@ public class NetQuotaRedisTests
     }
 
     [Fact]
+    public async Task Entitlement_RewriteWithoutTimezone_PreservesStoredTimezone()
+    {
+        var connection = await SharedConnection.Value;
+        Assert.SkipWhen(connection is null, RedisNotConfigured);
+        var conn = connection!;
+
+        var prefix = UniquePrefix();
+        var storage = new RedisQuotaStorage(conn, new RedisQuotaOptions { KeyPrefix = prefix });
+        var now = DateTimeOffset.UtcNow;
+
+        await storage.SetEntitlementAsync(
+            new QuotaEntitlement("user_tz", "free", now, now, Timezone: "Europe/Bucharest"));
+        await storage.SetEntitlementAsync(
+            new QuotaEntitlement("user_tz", "pro", now, now.AddMinutes(1)));
+
+        var stored = await storage.GetEntitlementAsync("user_tz");
+        Assert.Equal("Europe/Bucharest", stored!.Timezone);
+        Assert.Equal("pro", stored.Tier);
+
+        await CleanupAsync(prefix);
+    }
+
+    [Fact]
     public async Task SealAndMigrationTombstone_SurviveEntitlementRewrite()
     {
         var connection = await SharedConnection.Value;
