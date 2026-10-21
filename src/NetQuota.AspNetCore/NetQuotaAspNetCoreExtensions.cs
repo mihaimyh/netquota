@@ -146,11 +146,14 @@ public sealed record NetQuotaEnforcementOptions
     public required Func<HttpContext, ValueTask<string?>> ResolveUserIdAsync { get; init; }
     public required Func<HttpContext, ValueTask<string>> ResolveResourceAsync { get; init; }
     public Func<HttpContext, ValueTask<int>> ResolveAmountAsync { get; init; } = NetQuotaAmountExtractors.Fixed(1);
+    /// <summary>
+    /// Optional idempotency key for the consume call. The default is <c>null</c>: a header supplied
+    /// by the caller is not a trust boundary, because a replayed consumption is reported as allowed
+    /// and the filter would execute the protected endpoint again without charging quota. Only return
+    /// a key derived from authoritative server state, and only when replays are safe for the endpoint.
+    /// </summary>
     public Func<HttpContext, ValueTask<string?>> ResolveIdempotencyKeyAsync { get; init; } =
-        ctx => ValueTask.FromResult(
-            ctx.Request.Headers.TryGetValue(NetQuotaHeaderNames.RequestId, out var v) && !string.IsNullOrWhiteSpace(v)
-                ? (string?)v.ToString()
-                : null);
+        _ => ValueTask.FromResult<string?>(null);
     public Func<HttpContext, ValueTask<string?>>? ResolveDistinctKeyAsync { get; init; }
     public Func<HttpContext, ValueTask<string?>>? ResolveExplicitTierAsync { get; init; }
     public PeriodType PeriodType { get; init; } = PeriodType.Auto;
