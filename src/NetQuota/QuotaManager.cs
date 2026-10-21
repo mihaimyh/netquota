@@ -458,21 +458,14 @@ public sealed class QuotaManager
         string? explicitTier = null,
         CancellationToken cancellationToken = default)
     {
-        if (amount < 0)
+        if (amount <= 0)
         {
-            throw new QuotaConfigValidationException("Consume amount cannot be negative.");
+            throw new QuotaConfigValidationException("Consume amount must be positive.");
         }
 
         if (periodType is not PeriodType.Daily and not PeriodType.Monthly)
         {
             throw new QuotaConfigValidationException("TryConsumeAsync supports Daily and Monthly period types.");
-        }
-
-        if (amount == 0)
-        {
-            var zeroUsage = await GetQuotaAsync(userId, resource, periodType, explicitTier, cancellationToken);
-            var zeroRem = zeroUsage.Limit == -1 ? -1 : zeroUsage.Remaining;
-            return new TryConsumeResult(true, zeroRem, 0, zeroUsage.Used);
         }
 
         var res = await ConsumeWithResultAsync(userId, resource, amount, periodType, options, explicitTier, cancellationToken);
@@ -512,9 +505,9 @@ public sealed class QuotaManager
         string? explicitTier = null,
         CancellationToken cancellationToken = default)
     {
-        if (amount < 0)
+        if (amount <= 0)
         {
-            throw new QuotaConfigValidationException("Consume amount cannot be negative.");
+            throw new QuotaConfigValidationException("Consume amount must be positive.");
         }
 
         var sw = Stopwatch.StartNew();
@@ -534,44 +527,6 @@ public sealed class QuotaManager
         var tierName = explicitTier ?? ResolveTierName(ent, now);
         var tierCfg = GetTierConfig(tierName);
         var activePromo = ent?.ActivePromotion(now);
-
-        if (amount == 0)
-        {
-            if (periodType == PeriodType.Auto)
-            {
-                var eff = await GetEffectiveQuotaAsync(userId, resource, tierName, cancellationToken);
-                var effPct = eff.Limit > 0 ? Math.Round(eff.Used * 100.0 / eff.Limit, 2) : 0.0;
-                return new ConsumeResult(
-                    Allowed: true,
-                    NewUsed: eff.Used,
-                    Limit: eff.Limit,
-                    Remaining: eff.Remaining,
-                    Percentage: effPct,
-                    Period: PeriodType.Auto,
-                    PeriodKey: string.Empty,
-                    ConsumedNewUnit: false,
-                    ResetAtUtc: eff.ResetAtUtc,
-                    DistinctKeys: [],
-                    EffectiveTier: tierName,
-                    Promotion: activePromo);
-            }
-
-            var q = await GetQuotaAsync(userId, resource, periodType, tierName, cancellationToken);
-            var qPct = q.Limit > 0 ? Math.Round(q.Used * 100.0 / q.Limit, 2) : 0.0;
-            return new ConsumeResult(
-                Allowed: true,
-                NewUsed: q.Used,
-                Limit: q.Limit,
-                Remaining: q.Remaining,
-                Percentage: qPct,
-                Period: periodType,
-                PeriodKey: q.PeriodKey,
-                ConsumedNewUnit: false,
-                ResetAtUtc: q.PeriodEndUtc,
-                DistinctKeys: q.DistinctKeys,
-                EffectiveTier: tierName,
-                Promotion: activePromo);
-        }
 
         // 0. Check idempotency BEFORE PeriodType.Auto cascade so replays return the exact charged period
         // without polling or caching against the first candidate period (goquota 2bbff1c / 9828c99 / 153b331).

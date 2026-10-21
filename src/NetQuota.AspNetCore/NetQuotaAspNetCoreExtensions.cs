@@ -79,21 +79,24 @@ public static class NetQuotaHttpHeaders
 
 public static class NetQuotaAmountExtractors
 {
-    public static Func<HttpContext, ValueTask<int>> Fixed(int amount = 1) =>
-        _ => ValueTask.FromResult(amount);
+    public static Func<HttpContext, ValueTask<int>> Fixed(int amount = 1)
+    {
+        ArgumentOutOfRangeException.ThrowIfLessThan(amount, 1);
+        return _ => ValueTask.FromResult(amount);
+    }
 
     public static Func<HttpContext, ValueTask<int>> FromHeader(string headerName, int fallback = 1) =>
         ctx =>
         {
             if (ctx.Request.Headers.TryGetValue(headerName, out var raw) &&
                 int.TryParse(raw.ToString(), NumberStyles.Integer, CultureInfo.InvariantCulture, out var parsed) &&
-                parsed >= 0)
+                parsed >= 1)
             {
                 // Clamp client-supplied amounts so one request cannot consume an absurd budget.
                 return ValueTask.FromResult(Math.Min(parsed, 1_000_000));
             }
 
-            return ValueTask.FromResult(fallback);
+            return ValueTask.FromResult(Math.Max(1, fallback));
         };
 
     public static Func<HttpContext, ValueTask<int>> FromBodyByteLength(int bytesPerUnit = 1, int minimumUnits = 1) =>
@@ -102,12 +105,12 @@ public static class NetQuotaAmountExtractors
             var len = ctx.Request.ContentLength ?? 0L;
             if (len <= 0)
             {
-                return ValueTask.FromResult(minimumUnits);
+                return ValueTask.FromResult(Math.Max(1, minimumUnits));
             }
 
             var divisor = Math.Max(1, bytesPerUnit);
-            var units = (int)Math.Ceiling((double)len / divisor);
-            return ValueTask.FromResult(Math.Max(minimumUnits, units));
+            var units = (int)Math.Min(1_000_000L, (long)Math.Ceiling((double)len / divisor));
+            return ValueTask.FromResult(Math.Max(Math.Max(1, minimumUnits), units));
         };
 
     public static Func<HttpContext, ValueTask<int>> FromJsonBodyInt(string propertyName, int fallback = 1) =>
@@ -120,7 +123,7 @@ public static class NetQuotaAmountExtractors
                 if (doc.RootElement.ValueKind == JsonValueKind.Object &&
                     doc.RootElement.TryGetProperty(propertyName, out var prop) &&
                     prop.TryGetInt32(out var val) &&
-                    val >= 0)
+                    val >= 1)
                 {
                     return val;
                 }
