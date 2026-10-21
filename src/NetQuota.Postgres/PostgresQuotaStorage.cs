@@ -116,6 +116,8 @@ public sealed partial class PostgresQuotaStorage :
                 throw;
             }
 
+            EnsureRecordOwnership(record.UserId, record.Resource, spec.UserId, spec.Resource, record.ConsumptionId);
+
             return new StorageConsumeOutcome(
                 record.Allowed, ConsumedNewUnit: false, WasIdempotencyHit: true,
                 record.NewUsed, record.EffectiveLimit, record.DistinctKeys, record.Window.PeriodType);
@@ -139,6 +141,8 @@ public sealed partial class PostgresQuotaStorage :
             var existing = await ReadConsumptionRecordAsync(connection, tx, scopedKey, spec.NowUtc, cancellationToken);
             if (existing is not null)
             {
+                EnsureRecordOwnership(
+                    existing.UserId, existing.Resource, spec.UserId, spec.Resource, scopedKey);
                 await tx.CommitAsync(cancellationToken);
                 return new StorageConsumeOutcome(
                     existing.Allowed, ConsumedNewUnit: false, WasIdempotencyHit: true,
@@ -148,7 +152,7 @@ public sealed partial class PostgresQuotaStorage :
 
         await AcquireUsageLockAsync(connection, tx, spec.UserId, spec.Resource, spec.Window, cancellationToken);
 
-        var (used, storedLimit, storedTier, start, end, distinct) = await ReadUsageAsync(
+        var (used, storedLimit, storedTier, storedStart, storedEnd, distinct) = await ReadUsageAsync(
             connection, tx, spec.UserId, spec.Resource, spec.Window, cancellationToken);
         var currentUsed = used ?? 0;
         var effectiveLimit = ResolveEffectiveLimit(spec.Window, spec.ConfiguredLimit, storedLimit, storedTier, spec.EffectiveTier);
@@ -186,7 +190,8 @@ public sealed partial class PostgresQuotaStorage :
         await UpsertUsageAsync(
             connection, tx, spec.UserId, spec.Resource, spec.Window,
             newUsed, effectiveLimit, spec.EffectiveTier ?? storedTier,
-            start, end, spec.NowUtc, cancellationToken);
+            storedStart ?? spec.Window.StartUtc, storedEnd ?? spec.Window.EndUtc,
+            spec.NowUtc, cancellationToken);
 
         if (!string.IsNullOrWhiteSpace(spec.DistinctKey))
         {
@@ -268,12 +273,18 @@ public sealed partial class PostgresQuotaStorage :
         var (_, _, tier, start, end, _) = await ReadUsageAsync(
             connection, tx, userId, resource, window, cancellationToken);
 
+        var normalizedUsed = Math.Max(0, used);
         await UpsertUsageAsync(
-            connection, tx, userId, resource, window, Math.Max(0, used), limit, tier,
+            connection, tx, userId, resource, window, normalizedUsed, limit, tier,
             start ?? window.StartUtc, end ?? window.EndUtc, now, cancellationToken);
 
-        await ReplaceDistinctAsync(
-            connection, tx, userId, resource, window, distinctKeys ?? [], cancellationToken);
+        // A null list means "not supplied": keep the stored dedupe keys, matching InMemoryQuotaStorage.
+        // Only an explicit list (or a reset to zero usage) replaces the set.
+        if (distinctKeys is not null || normalizedUsed == 0)
+        {
+            await ReplaceDistinctAsync(
+                connection, tx, userId, resource, window, distinctKeys ?? [], cancellationToken);
+        }
 
         await tx.CommitAsync(cancellationToken);
     }
@@ -303,6 +314,8 @@ public sealed partial class PostgresQuotaStorage :
                 throw;
             }
 
+            EnsureRecordOwnership(record.UserId, record.Resource, request.UserId, request.Resource, scopedKey);
+
             return new StorageRefundOutcome(record.Window.PeriodType, Amount: 0, Replayed: true);
         }
     }
@@ -329,6 +342,8 @@ public sealed partial class PostgresQuotaStorage :
             var existing = await ReadRefundRecordAsync(connection, tx, scopedKey, nowUtc, cancellationToken);
             if (existing is not null)
             {
+                EnsureRecordOwnership(
+                    existing.UserId, existing.Resource, request.UserId, request.Resource, scopedKey);
                 await tx.CommitAsync(cancellationToken);
                 return new StorageRefundOutcome(existing.Window.PeriodType, Amount: 0, Replayed: true);
             }

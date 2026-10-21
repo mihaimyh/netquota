@@ -55,7 +55,7 @@ public sealed partial class PostgresQuotaStorage
             SELECT user_id, resource, action, amount, actor, reason, timestamp_utc
             FROM netquota_audit_logs
             {(where.Count > 0 ? "WHERE " + string.Join(" AND ", where) : string.Empty)}
-            ORDER BY timestamp_utc DESC
+            ORDER BY timestamp_utc DESC, id DESC
             LIMIT @limit
             """;
 

@@ -28,15 +28,24 @@ public sealed partial class PostgresQuotaStorage
             connection, tx, $"merge-record:{request.IdempotencyKey}", MergeRecordLockSalt, cancellationToken);
 
         var existing = await ReadMergeRecordAsync(connection, tx, request.IdempotencyKey, cancellationToken);
-        if (existing is not null)
+        if (existing is { } record)
         {
+            // The key is global, so a replay must prove it names the same pair; otherwise it is a
+            // different merge reported as already done.
+            if (!string.Equals(record.Source, request.SourceUserId, StringComparison.Ordinal) ||
+                !string.Equals(record.Target, request.TargetUserId, StringComparison.Ordinal))
+            {
+                throw new QuotaException(
+                    $"Merge idempotency key '{request.IdempotencyKey}' was already used for a different user pair.");
+            }
+
             await tx.CommitAsync(cancellationToken);
             return new MergeUserResult(
                 request.SourceUserId,
                 request.TargetUserId,
                 AlreadyMerged: true,
-                existing.TransferredUsage,
-                existing.TransferredForever);
+                record.Payload.TransferredUsage,
+                record.Payload.TransferredForever);
         }
 
         // Deterministic lock order across the two identities prevents merge/merge deadlocks.
@@ -72,7 +81,11 @@ public sealed partial class PostgresQuotaStorage
             await AcquireAdvisoryLockAsync(connection, tx, key, UsageLockSalt, cancellationToken);
         }
 
-        var droppedPromotion = await ReadPromotionAsync(connection, tx, request.SourceUserId, cancellationToken);
+        // Only a merge that actually seals the source clears the overlay, so only that merge can
+        // report a dropped promotion — and only an overlay that is still in effect counts.
+        var droppedPromotion = request.SealSource
+            ? await ReadPromotionAsync(connection, tx, request.SourceUserId, request.NowUtc, cancellationToken)
+            : null;
 
         var transferredUsage = new Dictionary<string, int>(StringComparer.Ordinal);
         var transferredForever = new Dictionary<string, int>(StringComparer.Ordinal);
@@ -124,8 +137,14 @@ public sealed partial class PostgresQuotaStorage
                 .ToArray();
 
             var targetUsedBefore = target.Used ?? 0;
-            var newTargetUsed = mergedDistinct.Length > 0
-                ? mergedDistinct.Length
+
+            // One distinct key means one charged unit only while every consume on both sides
+            // charged exactly one unit. Amounts above one make the key count smaller than the real
+            // usage, and replacing Used with it would erase usage (ISM-01).
+            var countBased = targetUsedBefore == target.Distinct.Count &&
+                             source.Used.Value == source.Distinct.Count;
+            var newTargetUsed = countBased
+                ? Math.Max(targetUsedBefore, mergedDistinct.Length)
                 : targetUsedBefore + source.Used.Value;
 
             // A stored limit of 0 means "unset", so it must not pin the target to zero.
@@ -266,14 +285,18 @@ public sealed partial class PostgresQuotaStorage
         NpgsqlConnection connection,
         NpgsqlTransaction tx,
         string userId,
+        DateTimeOffset nowUtc,
         CancellationToken cancellationToken)
     {
         await using var command = Command(connection, tx, """
             SELECT promotion_tier, promotion_granted_at_utc, promotion_expires_at_utc,
                    promotion_source, promotion_reason, promotion_idempotency_key
-            FROM netquota_entitlements WHERE user_id = @user
+            FROM netquota_entitlements
+            WHERE user_id = @user
+              AND (promotion_expires_at_utc IS NULL OR promotion_expires_at_utc > @now)
             """,
-            ("user", userId));
+            ("user", userId),
+            ("now", nowUtc));
 
         await using var reader = await command.ExecuteReaderAsync(cancellationToken);
         if (!await reader.ReadAsync(cancellationToken) || reader.IsDBNull(0))
@@ -290,19 +313,25 @@ public sealed partial class PostgresQuotaStorage
             IdempotencyKey: reader.IsDBNull(5) ? null : reader.GetString(5));
     }
 
-    private static async Task<MergeRecordPayload?> ReadMergeRecordAsync(
+    private static async Task<(string Source, string Target, MergeRecordPayload Payload)?> ReadMergeRecordAsync(
         NpgsqlConnection connection,
         NpgsqlTransaction tx,
         string idempotencyKey,
         CancellationToken cancellationToken)
     {
         await using var command = Command(connection, tx,
-            "SELECT result FROM netquota_merge_records WHERE idempotency_key = @key",
+            "SELECT source_user_id, target_user_id, result FROM netquota_merge_records WHERE idempotency_key = @key",
             ("key", idempotencyKey));
 
-        var value = await command.ExecuteScalarAsync(cancellationToken);
-        return value is string json
-            ? JsonSerializer.Deserialize<MergeRecordPayload>(json)
-            : null;
+        await using var reader = await command.ExecuteReaderAsync(cancellationToken);
+        if (!await reader.ReadAsync(cancellationToken))
+        {
+            return null;
+        }
+
+        return (
+            reader.GetString(0),
+            reader.GetString(1),
+            JsonSerializer.Deserialize<MergeRecordPayload>(reader.GetString(2))!);
     }
 }
