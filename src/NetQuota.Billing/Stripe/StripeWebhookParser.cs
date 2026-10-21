@@ -44,7 +44,7 @@ public static class StripeWebhookParser
                     ParseInvoice(type, eventId, timestamp, obj, options),
                 "payment_intent.succeeded" =>
                     ParseCreditPurchase(BillingWebhookKind.OneTimePurchase, "amount_received", type, eventId, timestamp, obj, options),
-                "payment_intent.refunded" =>
+                "payment_intent.refunded" or "charge.refunded" =>
                     ParseCreditPurchase(BillingWebhookKind.Refund, "amount_refunded", type, eventId, timestamp, obj, options),
                 _ => BillingWebhookResult.Ignored($"unhandled event type {type}")
             };
@@ -171,14 +171,43 @@ public static class StripeWebhookParser
         var metadata = obj.TryGetProperty("metadata", out var m) ? m : default;
         var userId = Text(metadata, "user_id");
         var resource = Text(metadata, "resource");
-        var credits = ParseInt(Text(metadata, "credits")) ?? ParseInt(Text(metadata, "amount"));
+        var packCredits = ParseInt(Text(metadata, "credits")) ?? ParseInt(Text(metadata, "amount"));
 
-        if (string.IsNullOrWhiteSpace(userId) || string.IsNullOrWhiteSpace(resource) || credits is null or <= 0)
+        if (string.IsNullOrWhiteSpace(userId) || string.IsNullOrWhiteSpace(resource) || packCredits is null or <= 0)
         {
             // Refunds of subscription invoices must not touch prepaid credits.
             return BillingWebhookResult.Ignored(kind == BillingWebhookKind.Refund
                 ? "refund without credit-pack metadata"
                 : "one-time payment without user_id/resource/credits metadata");
+        }
+
+        var credits = packCredits.Value;
+        var priceCents = Long(obj, amountField) ?? Long(obj, "amount") ?? 0;
+        var identity = eventId;
+
+        if (kind == BillingWebhookKind.Refund)
+        {
+            // A pack can be refunded in several partial refunds, and Stripe emits both
+            // payment_intent.refunded and charge.refunded for the same refund. Revoke only this
+            // refund's share of the pack and key it by the refund id, so the events cannot revoke
+            // the whole pack once per event or twice for the same refund.
+            var entry = Nested(obj, "refunds", "data", "0");
+            var refundedAmount = (entry is { } e ? Long(e, "amount") : null) ?? Long(obj, "amount_refunded");
+            identity = (entry is { } e2 ? Text(e2, "id") : null) ?? eventId;
+
+            if (refundedAmount is null or <= 0)
+            {
+                return BillingWebhookResult.Ignored("refund without amount");
+            }
+
+            var total = Long(obj, "amount_received") ?? Long(obj, "amount");
+            credits = total is > 0
+                ? (int)Math.Clamp(
+                    Math.Round(packCredits.Value * (double)refundedAmount.Value / total.Value, MidpointRounding.AwayFromZero),
+                    0,
+                    packCredits.Value)
+                : packCredits.Value;
+            priceCents = refundedAmount.Value;
         }
 
         return new BillingWebhookResult(kind, new BillingWebhookEvent
@@ -187,18 +216,18 @@ public static class StripeWebhookParser
             NewTier = options.DefaultTier,
             Provider = "stripe",
             EventType = type,
-            EventId = eventId,
+            EventId = identity,
             EventTimestamp = timestamp,
             ProductId = Text(metadata, "price_id") ?? string.Empty,
             Store = "stripe",
             Currency = (Text(obj, "currency") ?? string.Empty).ToUpperInvariant(),
-            PriceCents = Long(obj, amountField) ?? Long(obj, "amount") ?? 0,
+            PriceCents = priceCents,
             CancelAtPeriodEnd = null,
             Metadata = new Dictionary<string, string>(StringComparer.Ordinal)
             {
                 ["resource"] = resource,
-                ["credits"] = credits.Value.ToString(CultureInfo.InvariantCulture),
-                ["payment_intent_id"] = Text(obj, "id") ?? string.Empty
+                ["credits"] = credits.ToString(CultureInfo.InvariantCulture),
+                ["payment_intent_id"] = Text(obj, "payment_intent") ?? Text(obj, "id") ?? string.Empty
             }
         });
     }
