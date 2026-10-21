@@ -55,16 +55,20 @@ Handled events:
 | `invoice.paid` / `invoice.payment_succeeded` | set tier + billing period facts |
 | `customer.subscription.deleted` | reconcile first; downgrade only when nothing else is active |
 | `payment_intent.succeeded` | grant credits (`metadata.user_id/resource/credits`), idempotent by event id |
-| `payment_intent.refunded` | refund credits, idempotent by event id |
+| `charge.refunded` / `payment_intent.refunded` | refund the individual refund's share, keyed by refund id (a full refund by payment intent) |
 
 Rules that matter:
 
 - **Unmapped price → ignored.** The stored tier is kept; a new/renamed Stripe price never downgrades
   a paying customer.
-- **Reconciliation wins on delete.** If a customer link exists, the provider queries Stripe and
-  keeps a still-active subscription; without a link it applies `DefaultTier`.
-- **Event id is the idempotency key** for credit grants/refunds. Stripe retries; duplicates must not
-  move money twice.
+- **Reconciliation wins on delete.** The provider learns the customer link from webhook metadata
+  (`customer`), so a customer created outside checkout (Payment Link, import) still reconciles
+  against Stripe and keeps a still-active subscription; without any link it applies `DefaultTier`.
+- **Credit grants are idempotent by event id.** Refunds are keyed by the individual refund id
+  (full refunds by payment intent) because `amount_refunded` is cumulative and `charge.refunds` is
+  not included in webhook payloads. A partial refund without that entry is ignored (fail-safe)
+  rather than over-revoking; a refund that rounds to zero credits skips the store but still fires
+  the callback. Stripe retries; duplicates must not move money twice.
 - **Equal timestamps apply**, strictly older events lose. Stripe emits several events in one second.
 - Checkout puts `metadata[user_id]` on the session **and** on `payment_intent_data[metadata]` for
   credit packs, so refunds arrive with the fields needed.

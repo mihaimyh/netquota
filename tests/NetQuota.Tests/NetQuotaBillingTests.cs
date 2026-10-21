@@ -40,6 +40,8 @@ public class NetQuotaBillingTests
 
         public List<string> RefundedKeys { get; } = [];
 
+        public List<int> RefundedAmounts { get; } = [];
+
         public Task GrantOneTimeCreditAsync(
             string userId, string resource, int amount, string reason,
             string? idempotencyKey = null, CancellationToken cancellationToken = default)
@@ -53,6 +55,7 @@ public class NetQuotaBillingTests
             string? idempotencyKey = null, CancellationToken cancellationToken = default)
         {
             RefundedKeys.Add(idempotencyKey ?? string.Empty);
+            RefundedAmounts.Add(amount);
             return Task.CompletedTask;
         }
     }
@@ -155,6 +158,32 @@ public class NetQuotaBillingTests
         Assert.False(limiter.TryAcquire("1.1.1.1", now));
         Assert.True(limiter.TryAcquire("1.1.1.1", now.AddSeconds(2)));
         Assert.Equal(0, limiter.Cleanup());
+    }
+
+    [Fact]
+    public void WebhookRateLimiter_RejectsNonPositiveLimitOrWindow()
+    {
+        // A zero limit used to admit one request per key per window and a zero window never limited.
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+        {
+            _ = new WebhookRateLimiter(limit: 0, window: TimeSpan.FromMinutes(1));
+        });
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+        {
+            _ = new WebhookRateLimiter(limit: -1, window: TimeSpan.FromMinutes(1));
+        });
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+        {
+            _ = new WebhookRateLimiter(limit: 1, window: TimeSpan.Zero);
+        });
+        Assert.Throws<ArgumentOutOfRangeException>(() =>
+        {
+            _ = new WebhookRateLimiter(limit: 1, window: TimeSpan.FromSeconds(-1));
+        });
+
+        var limiter = new WebhookRateLimiter(limit: 3, window: TimeSpan.FromMinutes(1));
+        Assert.Equal(3, limiter.Limit);
+        Assert.Equal(TimeSpan.FromMinutes(1), limiter.Window);
     }
 
     // ---------- Stripe signature ----------
@@ -330,6 +359,73 @@ public class NetQuotaBillingTests
         Assert.Contains(handler.Requests, r => r.Path.StartsWith("/v1/subscriptions", StringComparison.Ordinal));
     }
 
+    [Fact]
+    public async Task StripeDeletedSubscription_WithoutStoredLink_ReconcilesWithTheEventCustomer()
+    {
+        const string secret = "whsec_test";
+        var store = new FakeStore();
+        store.Seed(new QuotaEntitlement("u1", "pro", DateTimeOffset.UtcNow.AddDays(-20), DateTimeOffset.UtcNow.AddMinutes(-5)));
+
+        // No stored link: the customer was created by a Payment Link or the customer table was rebuilt.
+        var customers = new InMemoryBillingCustomerStore();
+        var handler = new RecordingHandler((request, _) => request.RequestUri!.AbsolutePath switch
+        {
+            "/v1/subscriptions" => Json("""
+                { "data": [ { "status": "active",
+                    "items": { "data": [ { "price": { "id": "price_pro" } } ] } } ] }
+                """),
+            _ => Json("{}", HttpStatusCode.NotFound)
+        });
+
+        var provider = new StripeBillingProvider(
+            StripeOptionsForTests(secret), store, customers, new HttpClient(handler));
+
+        var created = DateTimeOffset.UtcNow.AddSeconds(1).ToUnixTimeSeconds();
+        var body = Encoding.UTF8.GetBytes($$"""
+            { "id": "evt_del_no_link", "type": "customer.subscription.deleted", "created": {{created}},
+              "data": { "object": { "id": "sub_cancelled", "customer": "cus_1", "status": "canceled",
+                "metadata": { "user_id": "u1" },
+                "items": { "data": [ { "price": { "id": "price_pro" } } ] } } } }
+            """);
+
+        await provider.HandleWebhookAsync(body, StripeSign(secret, Encoding.UTF8.GetString(body)));
+
+        Assert.Contains(handler.Requests, r => r.Path.StartsWith("/v1/subscriptions", StringComparison.Ordinal));
+        Assert.Equal("pro", store.Entitlements["u1"].Tier);
+    }
+
+    [Fact]
+    public async Task StripeSubscriptionWebhook_LearnsCustomerLink_AndPortalUsesIt()
+    {
+        const string secret = "whsec_test";
+        var store = new FakeStore();
+        var customers = new InMemoryBillingCustomerStore();
+        var handler = new RecordingHandler((request, _) => request.RequestUri!.AbsolutePath switch
+        {
+            "/v1/billing_portal/sessions" => Json("""{"url":"https://portal.test/1"}"""),
+            _ => Json("{}", HttpStatusCode.NotFound)
+        });
+
+        var provider = new StripeBillingProvider(
+            StripeOptionsForTests(secret), store, customers, new HttpClient(handler));
+
+        var body = Encoding.UTF8.GetBytes("""
+            { "id": "evt_sub", "type": "customer.subscription.created", "created": 1760000100,
+              "data": { "object": { "id": "sub_1", "customer": "cus_9", "status": "active",
+                "metadata": { "user_id": "u1" },
+                "items": { "data": [ { "price": { "id": "price_pro" } } ] } } } }
+            """);
+
+        await provider.HandleWebhookAsync(body, StripeSign(secret, Encoding.UTF8.GetString(body)));
+
+        Assert.Equal("cus_9", await customers.GetCustomerIdAsync("stripe", "u1"));
+
+        var portal = await provider.PortalUrlAsync("u1", "https://app.test/back");
+        Assert.Equal("https://portal.test/1", portal);
+        var portalRequest = Assert.Single(handler.Requests, r => r.Path == "/v1/billing_portal/sessions");
+        Assert.Contains("customer=cus_9", portalRequest.Body, StringComparison.Ordinal);
+    }
+
     // ---------- RevenueCat parser ----------
 
     [Fact]
@@ -484,6 +580,34 @@ public class NetQuotaBillingTests
     }
 
     [Fact]
+    public async Task RevenueCatTransfer_WithoutEligibleDestination_KeepsSourceEntitled()
+    {
+        var store = new FakeStore();
+        store.Seed(new QuotaEntitlement(
+            "source", "pro", DateTimeOffset.UtcNow.AddDays(-10), DateTimeOffset.UtcNow.AddMinutes(-1)));
+
+        var callbacks = new List<BillingWebhookEvent>();
+        var provider = new RevenueCatBillingProvider(
+            RevenueCatOptionsForTests(), store, new HttpClient(),
+            (evt, _) => { callbacks.Add(evt); return Task.CompletedTask; });
+
+        // The only destination is an anonymous alias, which the parser filters out: nobody can
+        // receive the entitlement, so the source must stay entitled.
+        var transferTimestamp = DateTimeOffset.UtcNow.AddMinutes(1).ToUnixTimeMilliseconds();
+        var body = Encoding.UTF8.GetBytes($$"""
+            { "event": { "id": "rc_transfer_anon", "type": "TRANSFER",
+                "transferred_from": ["source"], "transferred_to": ["$RCAnonymousID:abc123"],
+                "event_timestamp_ms": {{transferTimestamp}} } }
+            """);
+
+        await provider.HandleWebhookAsync(body, "Bearer rc_secret", null);
+
+        Assert.Equal("pro", store.Entitlements["source"].Tier);
+        Assert.Empty(store.Writes);
+        Assert.Empty(callbacks);
+    }
+
+    [Fact]
     public async Task RevenueCatSync_EscapesTheSubscriberId()
     {
         var store = new FakeStore();
@@ -602,22 +726,59 @@ public class NetQuotaBillingTests
     }
 
     [Fact]
-    public async Task StripeRefund_UsesEventIdAsIdempotencyKey()
+    public async Task StripeFullRefund_UsesPaymentIntentIdentity_NotTheEventId()
     {
         const string secret = "whsec_test";
         var store = new FakeStore();
         var provider = new StripeBillingProvider(
             StripeOptionsForTests(secret), store, new InMemoryBillingCustomerStore(), new HttpClient());
 
+        // No expanded refunds list: only a full refund (amount_refunded == amount) is revoked, under
+        // a payment-intent identity so both refund event types deduplicate.
         var body = Encoding.UTF8.GetBytes("""
             { "id": "evt_refund_1", "type": "payment_intent.refunded", "created": 1760000000,
-              "data": { "object": { "id": "pi_1", "amount_refunded": 499, "currency": "ron",
+              "data": { "object": { "id": "pi_1", "amount": 499, "amount_refunded": 499, "currency": "ron",
                 "metadata": { "user_id": "u1", "resource": "credits", "credits": "10" } } } }
             """);
 
         await provider.HandleWebhookAsync(body, StripeSign(secret, Encoding.UTF8.GetString(body)));
 
-        Assert.Equal("evt_refund_1", Assert.Single(store.RefundedKeys));
+        Assert.Equal("refund-full:pi_1", Assert.Single(store.RefundedKeys));
+        Assert.Equal(10, Assert.Single(store.RefundedAmounts));
+    }
+
+    [Fact]
+    public async Task StripeSubCreditRefund_SkipsTheStore_ButStillReturnsTheEventAndCallback()
+    {
+        const string secret = "whsec_test";
+        var store = new FakeStore();
+        BillingWebhookEvent? callbackEvent = null;
+        var provider = new StripeBillingProvider(
+            StripeOptionsForTests(secret),
+            store,
+            new InMemoryBillingCustomerStore(),
+            new HttpClient(),
+            (evt, _) => { callbackEvent = evt; return Task.CompletedTask; });
+
+        // $50 pack of 10 credits; a $0.20 refund is 0.4 credits and rounds to zero.
+        var body = Encoding.UTF8.GetBytes("""
+            { "id": "evt_refund_tiny", "type": "charge.refunded", "created": 1760000000,
+              "data": { "object": {
+                "id": "ch_pack10", "object": "charge", "payment_intent": "pi_pack10",
+                "amount": 5000, "amount_refunded": 20, "currency": "usd",
+                "metadata": { "user_id": "u1", "resource": "credits", "credits": "10" },
+                "refunds": { "object": "list", "data": [
+                  { "id": "re_tiny", "object": "refund", "amount": 20, "currency": "usd" } ] } } } }
+            """);
+
+        var result = await provider.HandleWebhookAsync(body, StripeSign(secret, Encoding.UTF8.GetString(body)));
+
+        Assert.Equal(BillingWebhookKind.Refund, result.Kind);
+        Assert.Empty(store.RefundedKeys);
+        Assert.Empty(store.RefundedAmounts);
+        Assert.NotNull(callbackEvent);
+        Assert.Equal("re_tiny", callbackEvent!.EventId);
+        Assert.Equal("0", callbackEvent.Metadata["credits"]);
     }
 
     [Fact]
@@ -628,12 +789,16 @@ public class NetQuotaBillingTests
         store.Seed(new QuotaEntitlement(
             "u1", "pro", DateTimeOffset.UtcNow.AddDays(-20), DateTimeOffset.UtcNow.AddDays(-1)));
 
+        // The event names cus_1, so the provider learns the link and reconciles: keep that call
+        // offline with a stub that reports no other active subscription.
+        var handler = new RecordingHandler((_, _) => Json("""{"data":[]}"""));
+
         var callbacks = new List<BillingWebhookEvent>();
         var provider = new StripeBillingProvider(
             StripeOptionsForTests(secret),
             store,
             new InMemoryBillingCustomerStore(),
-            new HttpClient(),
+            new HttpClient(handler),
             (evt, _) => { callbacks.Add(evt); return Task.CompletedTask; });
 
         var created = DateTimeOffset.UtcNow.AddSeconds(1).ToUnixTimeSeconds();

@@ -166,21 +166,25 @@ public sealed class RevenueCatBillingProvider
     {
         var fromIds = result.TransferredFrom ?? [];
         var toIds = result.TransferredTo ?? [];
-        if (fromIds.Count == 0 && toIds.Count == 0)
+
+        // No eligible destination (anonymous aliases are filtered): downgrading the sources would
+        // revoke the paying subscriber's tier without entitling anyone.
+        if (fromIds.Count == 0 || toIds.Count == 0)
         {
             return;
         }
 
         var eventTimestamp = result.Event?.EventTimestamp ?? DateTimeOffset.UtcNow;
         var snapshot = await BestTransferSnapshotAsync(fromIds, cancellationToken);
+        if (snapshot is null)
+        {
+            // Nothing to move: keep the sources entitled.
+            return;
+        }
 
+        var entitledDestinations = 0;
         foreach (var destination in toIds)
         {
-            if (snapshot is null)
-            {
-                continue;
-            }
-
             var existing = await _store.GetEntitlementAsync(destination, cancellationToken);
             if (BillingEntitlementTransition.IsStale(existing, eventTimestamp))
             {
@@ -199,11 +203,18 @@ public sealed class RevenueCatBillingProvider
 
             await _store.SetEntitlementAsync(entitlement, cancellationToken);
             _metrics?.RecordTransfer(Name, "to");
+            entitledDestinations++;
 
             if (_callback is not null)
             {
                 await _callback(BuildTransferEvent(result, destination, entitlement, "to"), cancellationToken);
             }
+        }
+
+        if (entitledDestinations == 0)
+        {
+            // The source is downgraded only after a destination is entitled.
+            return;
         }
 
         foreach (var source in fromIds)

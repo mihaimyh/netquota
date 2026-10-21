@@ -123,16 +123,17 @@ public static class StripeWebhookParser
             return BillingWebhookResult.Ignored("missing user id");
         }
 
-        var priceId = NestedText(obj, "lines", "data", "0", "price", "id");
+        var line = InvoiceLine(obj, options);
+        var priceId = line is { } selected ? NestedText(selected, "price", "id") : null;
         var (tier, known) = ResolveTier(priceId, obj, options);
         if (!known)
         {
             return BillingWebhookResult.Ignored($"unknown price '{priceId}'");
         }
 
-        var start = NestedUnixSeconds(obj, "lines", "data", "0", "period", "start");
-        var end = NestedUnixSeconds(obj, "lines", "data", "0", "period", "end");
-        var currency = NestedText(obj, "lines", "data", "0", "price", "currency") ?? Text(obj, "currency");
+        var start = line is { } periodStart ? NestedUnixSeconds(periodStart, "period", "start") : null;
+        var end = line is { } periodEnd ? NestedUnixSeconds(periodEnd, "period", "end") : null;
+        var currency = (line is { } priced ? NestedText(priced, "price", "currency") : null) ?? Text(obj, "currency");
 
         return new BillingWebhookResult(BillingWebhookKind.Subscription, new BillingWebhookEvent
         {
@@ -187,27 +188,56 @@ public static class StripeWebhookParser
 
         if (kind == BillingWebhookKind.Refund)
         {
-            // A pack can be refunded in several partial refunds, and Stripe emits both
-            // payment_intent.refunded and charge.refunded for the same refund. Revoke only this
-            // refund's share of the pack and key it by the refund id, so the events cannot revoke
-            // the whole pack once per event or twice for the same refund.
+            // `amount_refunded` is CUMULATIVE, and `charge.refunds` is an includable field that Stripe
+            // does not return in webhook payloads. Only the individual refund entry describes this
+            // refund's share; using the cumulative amount revokes 20 + 40 + 60 ... credits for three
+            // 20% refunds. A partial refund without that entry is ignored (fail-safe) instead of
+            // over-revoking, and a full refund revokes the pack once under a payment-intent identity
+            // so charge.refunded and payment_intent.refunded for the same refund deduplicate.
             var entry = Nested(obj, "refunds", "data", "0");
-            var refundedAmount = (entry is { } e ? Long(e, "amount") : null) ?? Long(obj, "amount_refunded");
-            identity = (entry is { } e2 ? Text(e2, "id") : null) ?? eventId;
-
-            if (refundedAmount is null or <= 0)
-            {
-                return BillingWebhookResult.Ignored("refund without amount");
-            }
-
             var total = Long(obj, "amount_received") ?? Long(obj, "amount");
-            credits = total is > 0
-                ? (int)Math.Clamp(
-                    Math.Round(packCredits.Value * (double)refundedAmount.Value / total.Value, MidpointRounding.AwayFromZero),
-                    0,
-                    packCredits.Value)
-                : packCredits.Value;
-            priceCents = refundedAmount.Value;
+            var cumulative = Long(obj, "amount_refunded");
+
+            if (entry is { } refund)
+            {
+                var refundedAmount = Long(refund, "amount");
+                if (refundedAmount is null or <= 0)
+                {
+                    return BillingWebhookResult.Ignored("refund without amount");
+                }
+
+                identity = Text(refund, "id") ?? eventId;
+                credits = total is > 0
+                    ? (int)Math.Clamp(
+                        Math.Round(packCredits.Value * (double)refundedAmount.Value / total.Value, MidpointRounding.AwayFromZero),
+                        0,
+                        packCredits.Value)
+                    : packCredits.Value;
+                priceCents = refundedAmount.Value;
+            }
+            else
+            {
+                if (cumulative is null or <= 0)
+                {
+                    return BillingWebhookResult.Ignored("refund without amount");
+                }
+
+                if (total is not > 0)
+                {
+                    // The refunded share cannot be established without the original amount.
+                    return BillingWebhookResult.Ignored("refund without the original amount");
+                }
+
+                if (cumulative < total)
+                {
+                    return BillingWebhookResult.Ignored(
+                        "partial refund without a refund entry; charge.refunds is not included in webhook payloads");
+                }
+
+                identity = "refund-full:" + (Text(obj, "payment_intent") ?? Text(obj, "id") ?? eventId);
+                credits = packCredits.Value;
+                priceCents = cumulative.Value;
+            }
         }
 
         return new BillingWebhookResult(kind, new BillingWebhookEvent
@@ -246,6 +276,43 @@ public static class StripeWebhookParser
         }
 
         return (options.DefaultTier, false);
+    }
+
+    /// <summary>
+    /// The invoice line that describes the subscription's current price: the first mapped,
+    /// non-proration line, then the first non-proration line, then the first line. Proration credits
+    /// for the previous price are billed first, so <c>lines.data[0]</c> alone can downgrade a
+    /// mid-cycle upgrade.
+    /// </summary>
+    private static JsonElement? InvoiceLine(JsonElement obj, StripeOptions options)
+    {
+        if (!obj.TryGetProperty("lines", out var lines) ||
+            !lines.TryGetProperty("data", out var data) ||
+            data.ValueKind != JsonValueKind.Array ||
+            data.GetArrayLength() == 0)
+        {
+            return null;
+        }
+
+        JsonElement? first = null;
+        JsonElement? firstNonProration = null;
+        foreach (var line in data.EnumerateArray())
+        {
+            first ??= line;
+            if (Bool(line, "proration") == true)
+            {
+                continue;
+            }
+
+            firstNonProration ??= line;
+            var priceId = NestedText(line, "price", "id");
+            if (priceId is not null && options.PriceToTier.ContainsKey(priceId))
+            {
+                return line;
+            }
+        }
+
+        return firstNonProration ?? first;
     }
 
     private static bool IsActiveStatus(string? status) =>
