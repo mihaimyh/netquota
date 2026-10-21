@@ -84,13 +84,19 @@ public sealed class StripeBillingProvider
         if (result.Kind == BillingWebhookKind.Refund && result.Event is { } refund)
         {
             var credits = StripeWebhookParser.ParseInt(refund.Metadata.GetValueOrDefault("credits")) ?? 0;
-            await _store.RefundCreditsAsync(
-                refund.UserId,
-                refund.Metadata["resource"],
-                credits,
-                refund.EventType,
-                idempotencyKey: refund.EventId,
-                cancellationToken);
+
+            // A refund can prorate to fewer than half a credit; the store requires a positive amount.
+            if (credits > 0)
+            {
+                await _store.RefundCreditsAsync(
+                    refund.UserId,
+                    refund.Metadata["resource"],
+                    credits,
+                    refund.EventType,
+                    idempotencyKey: refund.EventId,
+                    cancellationToken);
+            }
+
             await InvokeAsync(refund, cancellationToken);
             return result;
         }
@@ -100,12 +106,23 @@ public sealed class StripeBillingProvider
             return result;
         }
 
+        // The event itself names the customer: learning it here keeps delete reconciliation and the
+        // billing portal working for customers created outside CheckoutUrlAsync (Payment Links,
+        // imports) or after the customer store was rebuilt.
+        var eventCustomerId = subscription.Metadata.GetValueOrDefault("customer_id");
+        if (!string.IsNullOrWhiteSpace(eventCustomerId) &&
+            string.IsNullOrWhiteSpace(await _customers.GetCustomerIdAsync(Name, subscription.UserId, cancellationToken)))
+        {
+            await _customers.SaveCustomerIdAsync(Name, subscription.UserId, eventCustomerId, cancellationToken);
+        }
+
         // A cancelled subscription must not drop the user if another one is still active
         // (goquota 48c14ee): reconcile against Stripe before downgrading, and use the event's own
         // timestamp so the reconciliation does not swallow the audit callback.
         if (subscription.EventType == "customer.subscription.deleted")
         {
-            var customerId = await _customers.GetCustomerIdAsync(Name, subscription.UserId, cancellationToken);
+            var customerId = await _customers.GetCustomerIdAsync(Name, subscription.UserId, cancellationToken)
+                             ?? eventCustomerId;
             if (string.IsNullOrWhiteSpace(customerId))
             {
                 // Without a customer link there is nothing to reconcile against: honour the event.

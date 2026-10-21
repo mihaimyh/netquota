@@ -17,13 +17,23 @@ public sealed class WebhookRateLimiter(int limit, TimeSpan window, int cleanupEv
         public DateTimeOffset ResetAt;
     }
 
+    // A non-positive limit or window silently disables the limiter (a zero limit admits one request
+    // per key per window); reject the configuration instead of failing open.
+    private readonly int _limit = limit > 0
+        ? limit
+        : throw new ArgumentOutOfRangeException(nameof(limit), limit, "Webhook rate limit must be positive.");
+
+    private readonly TimeSpan _window = window > TimeSpan.Zero
+        ? window
+        : throw new ArgumentOutOfRangeException(nameof(window), window, "Webhook rate window must be positive.");
+
     private readonly Dictionary<string, Bucket> _buckets = new(StringComparer.Ordinal);
     private readonly Lock _gate = new();
     private readonly int _cleanupEvery = Math.Max(1, cleanupEvery);
     private int _requests;
 
-    public int Limit { get; } = limit;
-    public TimeSpan Window { get; } = window;
+    public int Limit => _limit;
+    public TimeSpan Window => _window;
 
     /// <summary>Honour <c>X-Forwarded-For</c>. Enable only behind a proxy that overwrites it.</summary>
     public bool TrustProxy { get; set; }
@@ -45,11 +55,11 @@ public sealed class WebhookRateLimiter(int limit, TimeSpan window, int cleanupEv
 
             if (!_buckets.TryGetValue(clientKey, out var bucket) || nowUtc >= bucket.ResetAt)
             {
-                _buckets[clientKey] = new Bucket { Count = 1, ResetAt = nowUtc.Add(Window) };
+                _buckets[clientKey] = new Bucket { Count = 1, ResetAt = nowUtc.Add(_window) };
                 return true;
             }
 
-            if (bucket.Count >= Limit)
+            if (bucket.Count >= _limit)
             {
                 return false;
             }
