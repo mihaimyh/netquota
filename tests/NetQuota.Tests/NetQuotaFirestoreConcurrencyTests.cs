@@ -1,7 +1,6 @@
 using Google.Cloud.Firestore;
 using NetQuota;
 using NetQuota.Firestore;
-using NetQuota;
 
 namespace NetQuota.Tests;
 

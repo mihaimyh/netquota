@@ -60,6 +60,9 @@ public sealed class LruQuotaCache<TValue>(int capacity)
     }
 
     /// <param name="key">Cache key; upserting an existing key refreshes its TTL and LRU position.</param>
+    /// <param name="value">Cached value.</param>
+    /// <param name="nowUtc">Current time used for the TTL.</param>
+    /// <param name="ttl">How long the entry stays valid.</param>
     /// <param name="group">
     /// Optional grouping key so <see cref="RemoveGroup"/> can evict every entry that belongs to one owner
     /// (for example one user) without scanning the whole cache.
