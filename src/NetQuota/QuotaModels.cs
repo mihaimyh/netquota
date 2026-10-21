@@ -71,8 +71,37 @@ public sealed record FallbackConfig(
 
 public sealed record QuotaConfig
 {
+    private IReadOnlyDictionary<string, TierConfig> _tiers =
+        new Dictionary<string, TierConfig>(StringComparer.OrdinalIgnoreCase);
+
     public string DefaultTier { get; init; } = "free";
-    public IReadOnlyDictionary<string, TierConfig> Tiers { get; init; } = new Dictionary<string, TierConfig>(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>
+    /// Tier lookup is case-insensitive by contract (goquota tier-casing regression). Normalize on every
+    /// assignment so dictionaries created by System.Text.Json or by hand cannot reintroduce ordinal lookup.
+    /// </summary>
+    public IReadOnlyDictionary<string, TierConfig> Tiers
+    {
+        get => _tiers;
+        init
+        {
+            if (value is Dictionary<string, TierConfig> existing &&
+                ReferenceEquals(existing.Comparer, StringComparer.OrdinalIgnoreCase))
+            {
+                _tiers = existing;
+                return;
+            }
+
+            var normalized = new Dictionary<string, TierConfig>(StringComparer.OrdinalIgnoreCase);
+            foreach (var (tierName, tierConfig) in value ?? new Dictionary<string, TierConfig>())
+            {
+                normalized[tierName] = tierConfig;
+            }
+
+            _tiers = normalized;
+        }
+    }
+
     public TimeZoneInfo PeriodTimeZone { get; init; } = TimeZoneInfo.Utc;
     public TimeSpan IdempotencyTtl { get; init; } = TimeSpan.FromHours(24);
     public CacheConfig? CacheConfig { get; init; }
@@ -96,6 +125,11 @@ public sealed record QuotaConfig
         if (!Tiers.ContainsKey(DefaultTier))
         {
             throw new QuotaConfigValidationException($"Default tier '{DefaultTier}' was not found in Tiers.");
+        }
+
+        if (IdempotencyTtl <= TimeSpan.Zero)
+        {
+            throw new QuotaConfigValidationException("IdempotencyTtl must be greater than zero.");
         }
 
         if (CircuitBreakerConfig is { Enabled: true, FailureThreshold: <= 0 })
@@ -169,7 +203,7 @@ public sealed record QuotaConfig
             {
                 foreach (var threshold in thresholds)
                 {
-                    if (threshold is <= 0.0 or > 1.0)
+                    if (!double.IsFinite(threshold) || threshold is <= 0.0 or > 1.0)
                     {
                         throw new QuotaConfigValidationException($"Tier '{tierName}' warning threshold for '{res}' must be in (0, 1].");
                     }

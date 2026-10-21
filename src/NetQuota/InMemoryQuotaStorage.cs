@@ -15,7 +15,8 @@ public sealed class InMemoryQuotaStorage(Func<DateTimeOffset>? clock = null)
         int Used,
         int Limit,
         List<string> DistinctKeys,
-        string? Tier = null);
+        string? Tier = null,
+        bool Drained = false);
 
     private sealed record IdempotencyState(
         StorageConsumeOutcome? ConsumeOutcome,
@@ -78,13 +79,14 @@ public sealed class InMemoryQuotaStorage(Func<DateTimeOffset>? clock = null)
                     entitlement = entitlement with { Timezone = existing.Timezone };
                 }
 
-                if (!entitlement.Sealed && existing.Sealed)
+                if (existing.Sealed)
                 {
+                    // A rewrite that only echoes Sealed = true must not clear the merge tombstone (ISM-03).
                     entitlement = entitlement with
                     {
                         Sealed = existing.Sealed,
-                        MigratedTo = existing.MigratedTo,
-                        SealExpiresAtUtc = existing.SealExpiresAtUtc
+                        MigratedTo = entitlement.MigratedTo ?? existing.MigratedTo,
+                        SealExpiresAtUtc = entitlement.SealExpiresAtUtc ?? existing.SealExpiresAtUtc
                     };
                 }
             }
@@ -152,7 +154,7 @@ public sealed class InMemoryQuotaStorage(Func<DateTimeOffset>? clock = null)
                     []));
             }
 
-            var effectiveLimit = window.PeriodType == PeriodType.Forever
+            var effectiveLimit = window.PeriodType == PeriodType.Forever || state.Drained
                 ? state.Limit
                 : (state.Limit != 0 ? state.Limit : defaultLimit);
 
@@ -216,7 +218,10 @@ public sealed class InMemoryQuotaStorage(Func<DateTimeOffset>? clock = null)
                 return Task.FromResult(replay);
             }
 
-            if (effectiveLimit != -1 && state.Used + spec.Amount > effectiveLimit)
+            // Checked addition: an amount that would exceed the cap or overflow the counter is denied,
+            // never allowed through wrapped arithmetic (A1 / ISM).
+            var requestedUsed = (long)state.Used + spec.Amount;
+            if (requestedUsed > int.MaxValue || (effectiveLimit != -1 && requestedUsed > effectiveLimit))
             {
                 return Task.FromResult(new StorageConsumeOutcome(
                     Allowed: false,
@@ -235,7 +240,7 @@ public sealed class InMemoryQuotaStorage(Func<DateTimeOffset>? clock = null)
                 newDistinct.Sort(StringComparer.Ordinal);
             }
 
-            var newUsed = state.Used + spec.Amount;
+            var newUsed = (int)requestedUsed;
             _usages[key] = new UsageState(newUsed, effectiveLimit, newDistinct, spec.EffectiveTier ?? state.Tier);
 
             var outcome = new StorageConsumeOutcome(
@@ -484,7 +489,7 @@ public sealed class InMemoryQuotaStorage(Func<DateTimeOffset>? clock = null)
                 ? state
                 : new UsageState(0, defaultLimit, []);
 
-            _usages[key] = existing with { Limit = Math.Max(0, existing.Used) };
+            _usages[key] = existing with { Limit = Math.Max(0, existing.Used), Drained = true };
             return Task.CompletedTask;
         }
     }
@@ -583,8 +588,13 @@ public sealed class InMemoryQuotaStorage(Func<DateTimeOffset>? clock = null)
                         .OrderBy(x => x, StringComparer.Ordinal)
                         .ToList();
 
-                    var newTargetUsed = mergedDistinct.Count > 0
-                        ? mergedDistinct.Count
+                    // A distinct key is one unit only when every recorded consume charged one unit.
+                    // Otherwise additive accounting is the only safe merge; never replace real usage
+                    // with the key count (ISM-01).
+                    var countBased = tgtState.Used == tgtState.DistinctKeys.Count &&
+                                     srcState.Used == srcState.DistinctKeys.Count;
+                    var newTargetUsed = countBased
+                        ? Math.Max(tgtState.Used, mergedDistinct.Count)
                         : tgtState.Used + srcState.Used;
 
                     var added = Math.Max(0, newTargetUsed - tgtState.Used);
@@ -705,7 +715,7 @@ public sealed class InMemoryQuotaStorage(Func<DateTimeOffset>? clock = null)
 
     private static int ResolveEffectiveLimitForConsume(StorageConsumeSpec spec, UsageState state)
     {
-        if (spec.Window.PeriodType == PeriodType.Forever)
+        if (spec.Window.PeriodType == PeriodType.Forever || state.Drained)
         {
             return state.Limit;
         }

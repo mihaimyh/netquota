@@ -36,6 +36,8 @@ Rules:
 - `ConsumptionOrder` must not contain `Auto`; it defines the cascade for `PeriodType.Auto`.
 - `InitialForeverCredits` is granted once per `(user, resource)` with a deterministic key.
 - `WarningThresholds` are fractions in `(0, 1]`.
+- `IdempotencyTtl` must be greater than zero; replay protection needs a positive window.
+- Tier names are case-insensitive, including tiers loaded from JSON configuration.
 
 ## Create the manager
 
@@ -69,6 +71,11 @@ result.ResetAtUtc;     // window end for the charged period
 
 Use `TryConsumeAsync` when a denial is a normal outcome (no exception), and `ConsumeAsync` when you
 prefer `QuotaExceededException`.
+
+`amount` must be between 1 and `QuotaManager.MaxConsumeAmount` (1,000,000); anything larger throws
+`QuotaConfigValidationException` instead of overflowing the usage counter. `explicitTier`, when set,
+must name a configured tier and only overrides the quota limits — the user's entitlement still supplies
+the period anchor, timezone, promotion, and seal state.
 
 ## Entitlements and promotions
 

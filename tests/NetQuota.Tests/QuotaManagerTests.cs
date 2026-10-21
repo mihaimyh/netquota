@@ -224,6 +224,11 @@ public class QuotaManagerTests
         };
         var manager = new QuotaManager(storage, config);
 
+        // The monthly anchor must exist before usage is recorded: an entitlement created mid-cycle
+        // starts a new anniversary window, which is the contract QM-01 fixes.
+        await manager.SetEntitlementAsync(
+            new QuotaEntitlement("u_edge", "free", now, now, Timezone: "Europe/Bucharest"));
+
         var firstConsume = await manager.ConsumeWithResultAsync(
             "u_edge",
             "api_calls",
@@ -572,6 +577,154 @@ public class QuotaManagerTests
         Assert.True(outcome.Allowed);
         Assert.Equal(-1, outcome.Limit);
         Assert.Equal(int.MaxValue, outcome.Remaining);
+    }
+
+    [Fact]
+    public async Task AnonymousMonthlyQuota_UsesCalendarMonth_AndDoesNotResetTheNextDay()
+    {
+        var now = new DateTimeOffset(2026, 10, 1, 9, 0, 0, TimeSpan.Zero);
+        var storage = new InMemoryQuotaStorage(() => now);
+        var config = new QuotaConfig
+        {
+            DefaultTier = "free",
+            Tiers = new Dictionary<string, TierConfig>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["free"] = new TierConfig
+                {
+                    MonthlyQuotas = new Dictionary<string, int> { ["api"] = 10 }
+                }
+            }
+        };
+        var manager = new QuotaManager(storage, config);
+
+        var first = await manager.ConsumeWithResultAsync("anon", "api", 10, PeriodType.Monthly);
+        Assert.True(first.Allowed);
+        Assert.Equal(10, first.NewUsed);
+
+        var second = await manager.ConsumeWithResultAsync("anon", "api", 1, PeriodType.Monthly);
+        Assert.False(second.Allowed);
+
+        // Before the fix the window key was anchored to "today", so the next day granted a fresh quota.
+        now = now.AddDays(1);
+        var nextDay = await manager.ConsumeWithResultAsync("anon", "api", 1, PeriodType.Monthly);
+        Assert.False(nextDay.Allowed);
+        Assert.Equal(10, nextDay.NewUsed);
+
+        // The calendar month rolls over on the 1st.
+        now = new DateTimeOffset(2026, 11, 1, 0, 0, 0, TimeSpan.Zero);
+        var nextMonth = await manager.ConsumeWithResultAsync("anon", "api", 1, PeriodType.Monthly);
+        Assert.True(nextMonth.Allowed);
+        Assert.Equal(1, nextMonth.NewUsed);
+    }
+
+    [Fact]
+    public async Task ExplicitTier_KeepsEntitlementAnchor_AndRejectsUnknownTier()
+    {
+        var anchor = new DateTimeOffset(2026, 1, 31, 0, 0, 0, TimeSpan.Zero);
+        var now = new DateTimeOffset(2026, 2, 15, 12, 0, 0, TimeSpan.Zero);
+        var storage = new InMemoryQuotaStorage(() => now);
+        var config = new QuotaConfig
+        {
+            DefaultTier = "free",
+            Tiers = new Dictionary<string, TierConfig>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["free"] = new TierConfig
+                {
+                    MonthlyQuotas = new Dictionary<string, int> { ["api"] = 100 }
+                },
+                ["pro"] = new TierConfig
+                {
+                    MonthlyQuotas = new Dictionary<string, int> { ["api"] = 1000 }
+                }
+            }
+        };
+        var manager = new QuotaManager(storage, config);
+        await manager.SetEntitlementAsync(new QuotaEntitlement("u1", "free", anchor, anchor));
+
+        // Consume inside the anniversary window 2026-01-31 -> 2026-02-28.
+        var consumed = await manager.ConsumeWithResultAsync("u1", "api", 5, PeriodType.Monthly);
+        Assert.True(consumed.Allowed);
+
+        // Before the fix the explicit tier discarded the entitlement and read a different window (Used = 0).
+        var quota = await manager.GetQuotaAsync("u1", "api", PeriodType.Monthly, explicitTier: "pro");
+        Assert.Equal(5, quota.Used);
+        Assert.Equal(1000, quota.Limit);
+
+        var peek = await manager.PeekAsync("u1", "api", PeriodType.Monthly, explicitTier: "pro");
+        Assert.Equal(5, peek.Used);
+        Assert.Equal(1000, peek.Limit);
+
+        await Assert.ThrowsAsync<QuotaConfigValidationException>(
+            () => manager.GetQuotaAsync("u1", "api", PeriodType.Monthly, explicitTier: "does-not-exist"));
+    }
+
+    [Fact]
+    public async Task MergeUser_NonForeverUsage_NeverReducesTargetUsed()
+    {
+        var now = new DateTimeOffset(2026, 10, 21, 12, 0, 0, TimeSpan.Zero);
+        var storage = new InMemoryQuotaStorage(() => now);
+        var config = new QuotaConfig
+        {
+            DefaultTier = "free",
+            Tiers = new Dictionary<string, TierConfig>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["free"] = new TierConfig
+                {
+                    DailyQuotas = new Dictionary<string, int> { ["docs"] = 100 }
+                }
+            }
+        };
+        var manager = new QuotaManager(storage, config);
+
+        await manager.ConsumeWithResultAsync(
+            "target", "docs", 5, PeriodType.Daily, new ConsumeOptions(DistinctKey: "doc-1"));
+        await manager.ConsumeWithResultAsync(
+            "source", "docs", 1, PeriodType.Daily, new ConsumeOptions(DistinctKey: "doc-2"));
+
+        var merge = await manager.MergeUserAsync(new MergeUserRequest(
+            SourceUserId: "source",
+            TargetUserId: "target",
+            Resources: ["docs"],
+            Periods: [PeriodType.Daily],
+            IdempotencyKey: "merge_docs"));
+
+        var target = await manager.GetQuotaAsync("target", "docs", PeriodType.Daily);
+        Assert.Equal(6, target.Used);
+        Assert.Equal(1, merge.TransferredUsage["docs:Daily"]);
+    }
+
+    [Fact]
+    public async Task DrainRemaining_WithZeroUsed_FreezesTheQuota()
+    {
+        var now = new DateTimeOffset(2026, 10, 21, 12, 0, 0, TimeSpan.Zero);
+        var storage = new InMemoryQuotaStorage(() => now);
+        var config = new QuotaConfig
+        {
+            DefaultTier = "free",
+            Tiers = new Dictionary<string, TierConfig>(StringComparer.OrdinalIgnoreCase)
+            {
+                ["free"] = new TierConfig
+                {
+                    DailyQuotas = new Dictionary<string, int> { ["api"] = 10 }
+                }
+            }
+        };
+        var manager = new QuotaManager(storage, config);
+
+        await manager.DrainRemainingAsync("u1", "api", PeriodType.Daily);
+
+        var quota = await manager.GetQuotaAsync("u1", "api", PeriodType.Daily);
+        Assert.Equal(0, quota.Limit);
+        Assert.Equal(0, quota.Remaining);
+
+        // Before the fix a zero drain wrote Limit = 0, which every read treated as "use the tier default".
+        var denied = await manager.ConsumeWithResultAsync("u1", "api", 1, PeriodType.Daily);
+        Assert.False(denied.Allowed);
+
+        // An explicit admin reset lifts the drain marker.
+        await manager.ResetUsageAsync("u1", "api", PeriodType.Daily);
+        var afterReset = await manager.ConsumeWithResultAsync("u1", "api", 1, PeriodType.Daily);
+        Assert.True(afterReset.Allowed);
     }
 
     private sealed class ToggleFailingStorage(InMemoryQuotaStorage inner) : IQuotaStorage
