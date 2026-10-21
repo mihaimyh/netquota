@@ -24,6 +24,10 @@ dotnet build NetQuota.slnx -c Release
 dotnet test NetQuota.slnx -c Release
 ```
 
+Always commit with the repository/global git identity. Never pass `-c user.name=...` or
+`-c user.email=...` on a commit: a fresh clone relies on the configured identity, and overriding it
+rewrites authorship.
+
 Integration tests skip (reported as skipped, never passed) unless configured:
 
 ```bash
