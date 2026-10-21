@@ -46,7 +46,14 @@ var storage = new RedisQuotaStorage(
   rate limiting are atomic.
 - Entitlements never expire by default: expiring them silently downgrades paying users if the
   billing sync is late.
-- Usage keys expire at window end + retention; forever credits never expire.
+- Usage hashes and their distinct-key sets expire at window end + retention; forever credits never
+  expire. Idempotency records live for the configured `IdempotencyTtl`; a non-positive TTL means the
+  request is not remembered. Distinct-key sets written before this version get their TTL on the next
+  write; expire any leftovers once during the upgrade.
+- Idempotency record keys escape the user id and the request id separately, so `("a:b", "c")` and
+  `("a", "b:c")` cannot share a record. Ids made only of unreserved characters keep their existing
+  keys; ids that contain `:` change shape, so a request issued just before the upgrade may be
+  replayed once. Existing `netquota:record:*` entries expire on their own TTL.
 - Targets a single Redis instance / sentinel. Redis Cluster needs every key of a script in one slot,
   which per-request idempotency keys cannot guarantee.
 - Merges are not supported (`UnsupportedQuotaOperationException`).

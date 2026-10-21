@@ -239,7 +239,9 @@ public sealed partial class RedisQuotaStorage :
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        var consumptionKey = string.IsNullOrWhiteSpace(spec.IdempotencyKey)
+        // A non-positive TTL means "do not remember this request" (InMemory expires it immediately).
+        // Treating it as "no expiry" kept money-path replay records forever.
+        var consumptionKey = string.IsNullOrWhiteSpace(spec.IdempotencyKey) || spec.IdempotencyTtl <= TimeSpan.Zero
             ? string.Empty
             : ConsumptionKey(spec.UserId, spec.IdempotencyKey);
 
@@ -256,7 +258,7 @@ public sealed partial class RedisQuotaStorage :
                 spec.EffectiveTier ?? string.Empty,
                 spec.DistinctKey ?? string.Empty,
                 FormatDate(spec.NowUtc),
-                (long)Math.Max(0, spec.IdempotencyTtl.TotalSeconds),
+                IdempotencyTtlSeconds(spec.IdempotencyTtl),
                 UsageTtlSeconds(spec.Window, spec.NowUtc),
                 spec.UserId,
                 spec.Resource,
@@ -358,7 +360,7 @@ public sealed partial class RedisQuotaStorage :
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        var refundKey = string.IsNullOrWhiteSpace(request.IdempotencyKey)
+        var refundKey = string.IsNullOrWhiteSpace(request.IdempotencyKey) || idempotencyTtl <= TimeSpan.Zero
             ? string.Empty
             : RefundKey(request.UserId, request.IdempotencyKey);
 
@@ -373,7 +375,7 @@ public sealed partial class RedisQuotaStorage :
                 Math.Max(0, request.Amount),
                 request.DistinctKeyToRemove ?? string.Empty,
                 FormatDate(nowUtc),
-                (long)Math.Max(0, idempotencyTtl.TotalSeconds),
+                IdempotencyTtlSeconds(idempotencyTtl),
                 request.UserId,
                 request.Resource,
                 window.PeriodType.ToString(),
@@ -460,14 +462,14 @@ public sealed partial class RedisQuotaStorage :
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        var topUpKey = string.IsNullOrWhiteSpace(idempotencyKey)
+        var topUpKey = string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyTtl <= TimeSpan.Zero
             ? string.Empty
-            : RecordKey($"topup:{userId}:{resource}:{idempotencyKey}");
+            : RecordKey($"topup:{Segment(userId)}:{Segment(resource)}:{Segment(idempotencyKey)}");
 
         await _db.ScriptEvaluateAsync(
             TopUpScript,
             [UsageKey(userId, resource, PeriodWindow.Forever), topUpKey],
-            [Math.Max(0, amount), (long)Math.Max(0, idempotencyTtl.TotalSeconds), FormatDate(nowUtc)]);
+            [Math.Max(0, amount), IdempotencyTtlSeconds(idempotencyTtl), FormatDate(nowUtc)]);
     }
 
     public async Task RefundForeverCreditsAsync(
@@ -481,14 +483,14 @@ public sealed partial class RedisQuotaStorage :
     {
         cancellationToken.ThrowIfCancellationRequested();
 
-        var refundKey = string.IsNullOrWhiteSpace(idempotencyKey)
+        var refundKey = string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyTtl <= TimeSpan.Zero
             ? string.Empty
-            : RecordKey($"refund_credits:{userId}:{resource}:{idempotencyKey}");
+            : RecordKey($"refund_credits:{Segment(userId)}:{Segment(resource)}:{Segment(idempotencyKey)}");
 
         await _db.ScriptEvaluateAsync(
             RefundCreditsScript,
             [UsageKey(userId, resource, PeriodWindow.Forever), refundKey],
-            [Math.Max(0, amount), (long)Math.Max(0, idempotencyTtl.TotalSeconds), FormatDate(nowUtc)]);
+            [Math.Max(0, amount), IdempotencyTtlSeconds(idempotencyTtl), FormatDate(nowUtc)]);
     }
 
     public async Task DrainRemainingAsync(
@@ -503,7 +505,7 @@ public sealed partial class RedisQuotaStorage :
         await _db.ScriptEvaluateAsync(
             DrainScript,
             [UsageKey(userId, resource, window)],
-            [FormatDate(DateTimeOffset.UtcNow)]);
+            [FormatDate(DateTimeOffset.UtcNow), UsageTtlSeconds(window, DateTimeOffset.UtcNow)]);
     }
 
     public Task<MergeUserResult> MergeUserAsync(
@@ -535,20 +537,38 @@ public sealed partial class RedisQuotaStorage :
 
         var nowMs = nowUtc.ToUnixTimeMilliseconds();
         var windowMs = Math.Max(1, (long)config.Window.TotalMilliseconds);
-        var ttlSeconds = (long)Math.Ceiling((config.Window + TimeSpan.FromMinutes(5)).TotalSeconds);
+        var burst = config.Burst > 0 ? config.Burst : config.Rate;
+
+        // A token bucket must outlive the time needed to refill an empty bucket. Sizing the TTL from
+        // the window alone let an idle depleted bucket expire and reset to a full burst.
+        var retention = config.Window;
+        if (config.Algorithm == RateLimitAlgorithm.TokenBucket)
+        {
+            var refillMs = Math.Ceiling((double)windowMs * Math.Max(1, burst) / Math.Max(1, config.Rate));
+            var refillWindow = TimeSpan.FromMilliseconds(refillMs);
+            if (refillWindow > retention)
+            {
+                retention = refillWindow;
+            }
+        }
+
+        var ttlSeconds = (long)Math.Ceiling((retention + TimeSpan.FromMinutes(5)).TotalSeconds);
 
         RedisResult[] result;
         if (config.Algorithm == RateLimitAlgorithm.TokenBucket)
         {
+            var globalKey = config.GlobalLimit > 0 ? RateLimitGlobalKey(resource) : string.Empty;
             result = AsArray(await _db.ScriptEvaluateAsync(
                 TokenBucketScript,
-                [RateLimitKey(resource, userId)],
+                [RateLimitKey(resource, userId), globalKey],
                 [
                     nowMs,
                     config.Rate,
                     windowMs,
-                    config.Burst > 0 ? config.Burst : config.Rate,
-                    ttlSeconds
+                    burst,
+                    ttlSeconds,
+                    config.GlobalLimit,
+                    $"{nowMs}:{Guid.NewGuid():N}"
                 ]));
         }
         else
@@ -648,6 +668,13 @@ public sealed partial class RedisQuotaStorage :
 
         return (long)Math.Ceiling(ttl.TotalSeconds);
     }
+
+    /// <summary>
+    /// Redis EXPIRE takes whole seconds. A positive sub-second TTL must still be remembered for at
+    /// least one second; a non-positive TTL must not be remembered at all.
+    /// </summary>
+    private static long IdempotencyTtlSeconds(TimeSpan ttl) =>
+        ttl <= TimeSpan.Zero ? 0 : Math.Max(1, (long)Math.Ceiling(ttl.TotalSeconds));
 
     private static RedisResult[] AsArray(RedisResult? result)
     {
