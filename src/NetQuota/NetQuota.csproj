@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net11.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PackageId>NetQuota</PackageId>
+    <Version>1.0.0</Version>
+    <Description>Production-ready subscription quota and hybrid rate-limiting engine for .NET (anniversary billing, prorated tier changes, forever credits, period-scoped distinct keys, tiered storage, promotions, merge user, and OpenTelemetry metrics).</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+  </PropertyGroup>
+
+</Project>
