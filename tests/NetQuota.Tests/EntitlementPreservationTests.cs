@@ -74,4 +74,65 @@ public class EntitlementPreservationTests
         Assert.Equal("pro", stored!.Promotion?.Tier);
         Assert.Equal("Europe/Bucharest", stored.Timezone);
     }
+
+    [Fact]
+    public async Task Rewrite_WithSealedFlag_PreservesSealTombstone()
+    {
+        var storage = new InMemoryQuotaStorage(() => Now);
+        var sealExpires = Now.AddDays(30);
+
+        await storage.SetEntitlementAsync(new QuotaEntitlement(
+            "u1",
+            "free",
+            Now,
+            Now,
+            Sealed: true,
+            MigratedTo: "target-user",
+            SealExpiresAtUtc: sealExpires));
+
+        // A billing sync that only echoes the sealed flag must not drop the tombstone (ISM-03).
+        await storage.SetEntitlementAsync(new QuotaEntitlement(
+            "u1",
+            "pro",
+            Now,
+            Now.AddMinutes(1),
+            Sealed: true));
+
+        var stored = await storage.GetEntitlementAsync("u1");
+
+        Assert.True(stored!.Sealed);
+        Assert.Equal("target-user", stored.MigratedTo);
+        Assert.Equal(sealExpires, stored.SealExpiresAtUtc);
+        Assert.False(stored.IsSealedAt(Now.AddDays(60)));
+    }
+
+    [Fact]
+    public async Task Rewrite_WithNewSealTombstone_OverridesStoredValues()
+    {
+        var storage = new InMemoryQuotaStorage(() => Now);
+
+        await storage.SetEntitlementAsync(new QuotaEntitlement(
+            "u1",
+            "free",
+            Now,
+            Now,
+            Sealed: true,
+            MigratedTo: "first-target",
+            SealExpiresAtUtc: Now.AddDays(30)));
+
+        var newExpiry = Now.AddDays(7);
+        await storage.SetEntitlementAsync(new QuotaEntitlement(
+            "u1",
+            "free",
+            Now,
+            Now.AddMinutes(1),
+            Sealed: true,
+            MigratedTo: "second-target",
+            SealExpiresAtUtc: newExpiry));
+
+        var stored = await storage.GetEntitlementAsync("u1");
+
+        Assert.Equal("second-target", stored!.MigratedTo);
+        Assert.Equal(newExpiry, stored.SealExpiresAtUtc);
+    }
 }

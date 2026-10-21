@@ -5,6 +5,12 @@ namespace NetQuota;
 
 public sealed class QuotaManager
 {
+    /// <summary>
+    /// Largest amount a single consume may charge. Larger amounts are rejected rather than trusted,
+    /// because the storage adapters add amounts to an <see cref="int"/> usage counter (A1).
+    /// </summary>
+    public const int MaxConsumeAmount = 1_000_000;
+
     private readonly IQuotaStorage _storage;
     private readonly QuotaConfig _config;
     private readonly LocalRateLimitEngine _localRateLimits = new();
@@ -71,6 +77,10 @@ public sealed class QuotaManager
             try
             {
                 return await timeSource.GetNowUtcAsync(cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
             }
             catch
             {
@@ -298,10 +308,9 @@ public sealed class QuotaManager
         }
 
         var now = await GetNowUtcAsync(cancellationToken);
-        var ent = string.IsNullOrWhiteSpace(explicitTier)
-            ? await GetEntitlementWithFallbackAsync(userId, now, cancellationToken)
-            : null;
-        var tierName = explicitTier ?? ResolveTierName(ent, now);
+        var explicitName = ValidateExplicitTier(explicitTier);
+        var ent = await GetEntitlementWithFallbackAsync(userId, now, cancellationToken);
+        var tierName = explicitName ?? ResolveTierName(ent, now);
         var tierCfg = GetTierConfig(tierName);
         var promo = ent?.ActivePromotion(now);
 
@@ -329,8 +338,9 @@ public sealed class QuotaManager
     {
         var sw = Stopwatch.StartNew();
         var now = await GetNowUtcAsync(cancellationToken);
-        var tierName = explicitTier;
-        if (string.IsNullOrWhiteSpace(tierName))
+        var explicitName = ValidateExplicitTier(explicitTier);
+        var tierName = explicitName;
+        if (tierName is null)
         {
             var ent = await GetEntitlementWithFallbackAsync(userId, now, cancellationToken);
             tierName = ResolveTierName(ent, now);
@@ -352,6 +362,10 @@ public sealed class QuotaManager
             try
             {
                 status = await _storage.CheckRateLimitAsync(userId, resource, rlConfig, now, cancellationToken);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+            {
+                throw;
             }
             catch (Exception ex)
             {
@@ -383,10 +397,9 @@ public sealed class QuotaManager
         var now = await GetNowUtcAsync(cancellationToken);
         await EnsureNotSealedAsync(userId, now, cancellationToken);
 
-        var ent = string.IsNullOrWhiteSpace(explicitTier)
-            ? await GetEntitlementWithFallbackAsync(userId, now, cancellationToken)
-            : null;
-        var tierName = explicitTier ?? ResolveTierName(ent, now);
+        var explicitName = ValidateExplicitTier(explicitTier);
+        var ent = await GetEntitlementWithFallbackAsync(userId, now, cancellationToken);
+        var tierName = explicitName ?? ResolveTierName(ent, now);
         var tierCfg = GetTierConfig(tierName);
         var promo = ent?.ActivePromotion(now);
 
@@ -505,9 +518,10 @@ public sealed class QuotaManager
         string? explicitTier = null,
         CancellationToken cancellationToken = default)
     {
-        if (amount <= 0)
+        if (amount <= 0 || amount > MaxConsumeAmount)
         {
-            throw new QuotaConfigValidationException("Consume amount must be positive.");
+            throw new QuotaConfigValidationException(
+                $"Consume amount must be between 1 and {MaxConsumeAmount}.");
         }
 
         var sw = Stopwatch.StartNew();
@@ -516,15 +530,14 @@ public sealed class QuotaManager
 
         await EnsureNotSealedAsync(userId, now, cancellationToken);
 
-        var ent = string.IsNullOrWhiteSpace(explicitTier)
-            ? await GetEntitlementWithFallbackAsync(userId, now, cancellationToken)
-            : null;
+        var explicitName = ValidateExplicitTier(explicitTier);
+        var ent = await GetEntitlementWithFallbackAsync(userId, now, cancellationToken);
         if (ent is not null && ent.IsSealedAt(now))
         {
             throw new UserSealedException(userId);
         }
 
-        var tierName = explicitTier ?? ResolveTierName(ent, now);
+        var tierName = explicitName ?? ResolveTierName(ent, now);
         var tierCfg = GetTierConfig(tierName);
         var activePromo = ent?.ActivePromotion(now);
 
@@ -1137,10 +1150,9 @@ public sealed class QuotaManager
         CancellationToken cancellationToken)
     {
         var now = await GetNowUtcAsync(cancellationToken);
-        var ent = string.IsNullOrWhiteSpace(explicitTier)
-            ? await GetEntitlementWithFallbackAsync(userId, now, cancellationToken)
-            : null;
-        var tierName = explicitTier ?? ResolveTierName(ent, now);
+        var explicitName = ValidateExplicitTier(explicitTier);
+        var ent = await GetEntitlementWithFallbackAsync(userId, now, cancellationToken);
+        var tierName = explicitName ?? ResolveTierName(ent, now);
         var tierCfg = GetTierConfig(tierName);
         var promo = ent?.ActivePromotion(now);
 
@@ -1235,8 +1247,9 @@ public sealed class QuotaManager
             }
         }
 
-        // Align monthly cycles with startOfDayUTC(now) when SubscriptionStartDateUtc is absent (goquota d25f469)
-        var monthlyAnchor = ent?.SubscriptionStartDateUtc ?? StartOfDayUtc(nowUtc);
+        // Without a subscription anchor, use the calendar month. Anchoring on "today" changes the
+        // period key every day and resets monthly quotas daily (QM-01).
+        var monthlyAnchor = ent?.SubscriptionStartDateUtc;
 
         return periodType switch
         {
@@ -1257,6 +1270,25 @@ public sealed class QuotaManager
     {
         var candidate = ent?.ResolveEffectiveTier(nowUtc, _config.DefaultTier) ?? _config.DefaultTier;
         return _config.Tiers.ContainsKey(candidate) ? candidate : _config.DefaultTier;
+    }
+
+    /// <summary>
+    /// Validates a caller-supplied tier override. The override selects quota limits only; the
+    /// entitlement still supplies the period anchor, timezone, promotion, and seal state (QM-02).
+    /// </summary>
+    private string? ValidateExplicitTier(string? explicitTier)
+    {
+        if (string.IsNullOrWhiteSpace(explicitTier))
+        {
+            return null;
+        }
+
+        if (!_config.Tiers.ContainsKey(explicitTier))
+        {
+            throw new QuotaConfigValidationException($"Unknown tier '{explicitTier}'.");
+        }
+
+        return explicitTier;
     }
 
     private TierConfig GetTierConfig(string tierName) =>
@@ -1283,6 +1315,10 @@ public sealed class QuotaManager
             }
         }
         catch (UserSealedException)
+        {
+            throw;
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
         {
             throw;
         }
@@ -1495,6 +1531,10 @@ public sealed class QuotaManager
         {
             var outcome = await _storage.TryConsumeAsync(spec, cancellationToken);
             return (outcome, false);
+        }
+        catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
+        {
+            throw;
         }
         catch (Exception ex)
         {
