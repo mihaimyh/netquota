@@ -65,8 +65,10 @@ public sealed class FirestoreQuotaStorage(
         string userId,
         CancellationToken cancellationToken = default)
     {
-        var doc = await EntitlementDoc(userId).GetSnapshotAsync(cancellationToken);
-        if (!doc.Exists)
+        var doc = await ReadFirstExistingAsync(
+            [EntitlementDoc(userId), LegacyEntitlementDoc(userId)],
+            cancellationToken);
+        if (doc is null)
         {
             return null;
         }
@@ -81,14 +83,17 @@ public sealed class FirestoreQuotaStorage(
         var docRef = EntitlementDoc(entitlement.UserId);
         await firestoreDb.RunTransactionAsync(async tx =>
         {
-            var snap = await tx.GetSnapshotAsync(docRef, cancellationToken);
+            var snap = await ReadFirstExistingAsync(
+                tx,
+                [docRef, LegacyEntitlementDoc(entitlement.UserId)],
+                cancellationToken);
             var effective = entitlement;
             if (effective.UpdatedAtUtc == default)
             {
                 effective = effective with { UpdatedAtUtc = DateTimeOffset.UtcNow };
             }
 
-            if (snap.Exists)
+            if (snap is not null)
             {
                 var existing = ParseEntitlement(entitlement.UserId, snap.ToDictionary());
                 if (effective.Promotion is null && existing.Promotion is { } promo)
@@ -124,20 +129,23 @@ public sealed class FirestoreQuotaStorage(
         var docRef = EntitlementDoc(userId);
         await firestoreDb.RunTransactionAsync(async tx =>
         {
-            var snap = await tx.GetSnapshotAsync(docRef, cancellationToken);
-            if (!snap.Exists)
+            var snap = await ReadFirstExistingAsync(
+                tx,
+                [docRef, LegacyEntitlementDoc(userId)],
+                cancellationToken);
+            if (snap is null)
             {
                 throw new QuotaException($"Entitlement for user '{userId}' was not found.");
             }
 
-            // Write only the promotion overlay without modifying UpdatedAtUtc or base fields (goquota 599b63f)
-            tx.Set(
-                docRef,
-                new Dictionary<string, object>
-                {
-                    ["promotion"] = SerializePromotion(promotion)
-                },
-                SetOptions.MergeAll);
+            // Write only the promotion overlay without modifying UpdatedAtUtc or base fields (goquota 599b63f).
+            // A document still under the legacy id is copied first so its tier and subscription
+            // anchor survive the migration to the hashed id.
+            var payload = IsLegacyDocument(snap, docRef)
+                ? snap.ToDictionary()
+                : new Dictionary<string, object>();
+            payload["promotion"] = SerializePromotion(promotion);
+            tx.Set(docRef, payload, SetOptions.MergeAll);
         }, cancellationToken: cancellationToken);
     }
 
@@ -148,20 +156,22 @@ public sealed class FirestoreQuotaStorage(
         var docRef = EntitlementDoc(userId);
         await firestoreDb.RunTransactionAsync(async tx =>
         {
-            var snap = await tx.GetSnapshotAsync(docRef, cancellationToken);
-            if (!snap.Exists)
+            var snap = await ReadFirstExistingAsync(
+                tx,
+                [docRef, LegacyEntitlementDoc(userId)],
+                cancellationToken);
+            if (snap is null)
             {
                 return;
             }
 
-            // Clear only the promotion overlay without modifying UpdatedAtUtc (goquota 599b63f)
-            tx.Set(
-                docRef,
-                new Dictionary<string, object>
-                {
-                    ["promotion"] = FieldValue.Delete
-                },
-                SetOptions.MergeAll);
+            // Clear only the promotion overlay without modifying UpdatedAtUtc (goquota 599b63f).
+            // A legacy document is copied so its base fields are not lost on migration.
+            var payload = IsLegacyDocument(snap, docRef)
+                ? snap.ToDictionary()
+                : new Dictionary<string, object>();
+            payload["promotion"] = FieldValue.Delete;
+            tx.Set(docRef, payload, SetOptions.MergeAll);
         }, cancellationToken: cancellationToken);
     }
 
@@ -172,8 +182,10 @@ public sealed class FirestoreQuotaStorage(
         int defaultLimit,
         CancellationToken cancellationToken = default)
     {
-        var doc = await UsageDoc(userId, resource, window).GetSnapshotAsync(cancellationToken);
-        if (!doc.Exists)
+        var doc = await ReadFirstExistingAsync(
+            [UsageDoc(userId, resource, window), LegacyUsageDoc(userId, resource, window)],
+            cancellationToken);
+        if (doc is null)
         {
             return new QuotaUsage(
                 userId,
@@ -214,17 +226,27 @@ public sealed class FirestoreQuotaStorage(
         CancellationToken cancellationToken = default)
     {
         var usageRef = UsageDoc(spec.UserId, spec.Resource, spec.Window);
+        var legacyUsageRef = LegacyUsageDoc(spec.UserId, spec.Resource, spec.Window);
         var consumeKey = !string.IsNullOrWhiteSpace(spec.IdempotencyKey)
-            ? NormalizeConsumeDocKey(spec.UserId, spec.IdempotencyKey)
+            ? ConsumeDocKey(spec.UserId, spec.IdempotencyKey)
+            : null;
+        var legacyConsumeKey = !string.IsNullOrWhiteSpace(spec.IdempotencyKey)
+            ? LegacyConsumeDocKey(spec.UserId, spec.IdempotencyKey)
             : null;
         DocumentReference? idemRef = consumeKey is not null ? IdempotencyDoc(consumeKey) : null;
-        DocumentReference? legacyIdemRef = consumeKey is not null ? LegacyIdempotencyDoc(consumeKey) : null;
+        var idemRefs = consumeKey is not null
+            ? IdempotencyReadRefs(consumeKey, legacyConsumeKey!)
+            : null;
 
         return await firestoreDb.RunTransactionAsync(async tx =>
         {
-            if (idemRef is not null)
+            if (idemRefs is not null)
             {
-                var idemSnap = await ReadIdempotencyAsync(tx, idemRef, legacyIdemRef!, cancellationToken);
+                var idemSnap = await ReadFirstOwnedIdempotencyAsync(
+                    tx,
+                    idemRefs,
+                    spec.UserId,
+                    cancellationToken);
                 if (idemSnap is not null)
                 {
                     var idemData = idemSnap.ToDictionary();
@@ -248,13 +270,16 @@ public sealed class FirestoreQuotaStorage(
                 }
             }
 
-            var usageSnap = await tx.GetSnapshotAsync(usageRef, cancellationToken);
+            var usageSnap = await ReadFirstExistingAsync(
+                tx,
+                [usageRef, legacyUsageRef],
+                cancellationToken);
             var used = 0;
             var storedLimit = spec.ConfiguredLimit;
             var storedTier = string.Empty;
             var distinct = new List<string>();
 
-            if (usageSnap.Exists)
+            if (usageSnap is not null)
             {
                 var data = usageSnap.ToDictionary();
                 used = ReadInt(data, "used", 0);
@@ -266,14 +291,14 @@ public sealed class FirestoreQuotaStorage(
             int effectiveLimit;
             if (spec.Window.PeriodType == PeriodType.Forever)
             {
-                effectiveLimit = usageSnap.Exists ? storedLimit : 0;
+                effectiveLimit = usageSnap is not null ? storedLimit : 0;
             }
             else if (spec.ConfiguredLimit == -1)
             {
                 // The tier's unlimited quota wins over a stored cap (goquota 4782f75).
                 effectiveLimit = -1;
             }
-            else if (usageSnap.Exists &&
+            else if (usageSnap is not null &&
                      !string.IsNullOrWhiteSpace(spec.EffectiveTier) &&
                      !string.IsNullOrWhiteSpace(storedTier) &&
                      string.Equals(storedTier, spec.EffectiveTier, StringComparison.OrdinalIgnoreCase) &&
@@ -365,11 +390,14 @@ public sealed class FirestoreQuotaStorage(
         var usageRef = UsageDoc(request.UserId, request.Resource, request.Window);
         await firestoreDb.RunTransactionAsync(async tx =>
         {
-            var snap = await tx.GetSnapshotAsync(usageRef, cancellationToken);
+            var snap = await ReadFirstExistingAsync(
+                tx,
+                [usageRef, LegacyUsageDoc(request.UserId, request.Resource, request.Window)],
+                cancellationToken);
             var currentUsed = request.CurrentUsed;
             IReadOnlyList<string> distinct = request.DistinctKeys ?? [];
 
-            if (snap.Exists)
+            if (snap is not null)
             {
                 var data = snap.ToDictionary();
                 currentUsed = ReadInt(data, "used", request.CurrentUsed);
@@ -425,17 +453,27 @@ public sealed class FirestoreQuotaStorage(
         CancellationToken cancellationToken = default)
     {
         var usageRef = UsageDoc(request.UserId, request.Resource, window);
+        var legacyUsageRef = LegacyUsageDoc(request.UserId, request.Resource, window);
         var refundKey = !string.IsNullOrWhiteSpace(request.IdempotencyKey)
-            ? NormalizeRefundDocKey(request.UserId, request.IdempotencyKey)
+            ? RefundDocKey(request.UserId, request.IdempotencyKey)
+            : null;
+        var legacyRefundKey = !string.IsNullOrWhiteSpace(request.IdempotencyKey)
+            ? LegacyRefundDocKey(request.UserId, request.IdempotencyKey)
             : null;
         DocumentReference? idemRef = refundKey is not null ? IdempotencyDoc(refundKey) : null;
-        DocumentReference? legacyIdemRef = refundKey is not null ? LegacyIdempotencyDoc(refundKey) : null;
+        var idemRefs = refundKey is not null
+            ? IdempotencyReadRefs(refundKey, legacyRefundKey!)
+            : null;
 
         return await firestoreDb.RunTransactionAsync(async tx =>
         {
-            if (idemRef is not null)
+            if (idemRefs is not null)
             {
-                var idemSnap = await ReadIdempotencyAsync(tx, idemRef, legacyIdemRef!, cancellationToken);
+                var idemSnap = await ReadFirstOwnedIdempotencyAsync(
+                    tx,
+                    idemRefs,
+                    request.UserId,
+                    cancellationToken);
                 if (idemSnap is not null)
                 {
                     var idemData = idemSnap.ToDictionary();
@@ -453,8 +491,8 @@ public sealed class FirestoreQuotaStorage(
                 }
             }
 
-            var snap = await tx.GetSnapshotAsync(usageRef, cancellationToken);
-            if (snap.Exists)
+            var snap = await ReadFirstExistingAsync(tx, [usageRef, legacyUsageRef], cancellationToken);
+            if (snap is not null)
             {
                 var data = snap.ToDictionary();
                 var used = ReadInt(data, "used", 0);
@@ -519,10 +557,20 @@ public sealed class FirestoreQuotaStorage(
         var docKey = scopedIdempotencyKey.StartsWith("consume_", StringComparison.Ordinal)
             ? scopedIdempotencyKey
             : $"consume_{scopedIdempotencyKey}";
-        var snap = await ReadIdempotencyAsync(
-            IdempotencyDoc(docKey),
-            LegacyIdempotencyDoc(docKey),
-            cancellationToken);
+        var scope = docKey["consume_".Length..];
+        DocumentSnapshot? snap;
+        if (TryParseLengthPrefixedScope(scope, out var ownerId, out var legacyScope))
+        {
+            snap = await ReadFirstOwnedIdempotencyAsync(
+                IdempotencyReadRefs(docKey, $"consume_{legacyScope}"),
+                ownerId,
+                cancellationToken);
+        }
+        else
+        {
+            snap = await ReadFirstExistingAsync(IdempotencyReadRefs(docKey), cancellationToken);
+        }
+
         if (snap is null)
         {
             return null;
@@ -571,10 +619,20 @@ public sealed class FirestoreQuotaStorage(
         var docKey = scopedIdempotencyKey.StartsWith("refund_", StringComparison.Ordinal)
             ? scopedIdempotencyKey
             : $"refund_{scopedIdempotencyKey}";
-        var snap = await ReadIdempotencyAsync(
-            IdempotencyDoc(docKey),
-            LegacyIdempotencyDoc(docKey),
-            cancellationToken);
+        var scope = docKey["refund_".Length..];
+        DocumentSnapshot? snap;
+        if (TryParseLengthPrefixedScope(scope, out var ownerId, out var legacyScope))
+        {
+            snap = await ReadFirstOwnedIdempotencyAsync(
+                IdempotencyReadRefs(docKey, $"refund_{legacyScope}"),
+                ownerId,
+                cancellationToken);
+        }
+        else
+        {
+            snap = await ReadFirstExistingAsync(IdempotencyReadRefs(docKey), cancellationToken);
+        }
+
         if (snap is null)
         {
             return null;
@@ -616,25 +674,32 @@ public sealed class FirestoreQuotaStorage(
         CancellationToken cancellationToken = default)
     {
         var usageRef = UsageDoc(userId, resource, PeriodWindow.Forever);
-        var topUpKey = !string.IsNullOrWhiteSpace(idempotencyKey) ? $"topup_{userId}_{resource}_{idempotencyKey}" : null;
+        var legacyUsageRef = LegacyUsageDoc(userId, resource, PeriodWindow.Forever);
+        var topUpKey = !string.IsNullOrWhiteSpace(idempotencyKey)
+            ? TopUpDocKey(userId, resource, idempotencyKey)
+            : null;
         DocumentReference? idemRef = topUpKey is not null ? IdempotencyDoc(topUpKey) : null;
-        DocumentReference? legacyIdemRef = topUpKey is not null ? LegacyIdempotencyDoc(topUpKey) : null;
+        var idemRefs = topUpKey is not null ? IdempotencyReadRefs(topUpKey) : null;
 
         await firestoreDb.RunTransactionAsync(async tx =>
         {
-            if (idemRef is not null)
+            if (idemRefs is not null)
             {
-                var idemSnap = await ReadIdempotencyAsync(tx, idemRef, legacyIdemRef!, cancellationToken);
+                var idemSnap = await ReadFirstOwnedIdempotencyAsync(
+                    tx,
+                    idemRefs,
+                    userId,
+                    cancellationToken);
                 if (idemSnap is not null && ReadTimestamp(idemSnap.ToDictionary(), "expiresAt", nowUtc) > nowUtc)
                 {
                     return;
                 }
             }
 
-            var snap = await tx.GetSnapshotAsync(usageRef, cancellationToken);
-            var used = snap.Exists ? ReadInt(snap.ToDictionary(), "used", 0) : 0;
-            var limit = snap.Exists ? ReadInt(snap.ToDictionary(), "limit", 0) : 0;
-            var distinct = snap.Exists ? ReadStringList(snap.ToDictionary(), "distinctKeys") : [];
+            var snap = await ReadFirstExistingAsync(tx, [usageRef, legacyUsageRef], cancellationToken);
+            var used = snap is not null ? ReadInt(snap.ToDictionary(), "used", 0) : 0;
+            var limit = snap is not null ? ReadInt(snap.ToDictionary(), "limit", 0) : 0;
+            var distinct = snap is not null ? ReadStringList(snap.ToDictionary(), "distinctKeys") : [];
 
             tx.Set(
                 usageRef,
@@ -664,23 +729,30 @@ public sealed class FirestoreQuotaStorage(
         CancellationToken cancellationToken = default)
     {
         var usageRef = UsageDoc(userId, resource, PeriodWindow.Forever);
-        var refundKey = !string.IsNullOrWhiteSpace(idempotencyKey) ? $"refund_credits_{userId}_{resource}_{idempotencyKey}" : null;
+        var legacyUsageRef = LegacyUsageDoc(userId, resource, PeriodWindow.Forever);
+        var refundKey = !string.IsNullOrWhiteSpace(idempotencyKey)
+            ? RefundCreditsDocKey(userId, resource, idempotencyKey)
+            : null;
         DocumentReference? idemRef = refundKey is not null ? IdempotencyDoc(refundKey) : null;
-        DocumentReference? legacyIdemRef = refundKey is not null ? LegacyIdempotencyDoc(refundKey) : null;
+        var idemRefs = refundKey is not null ? IdempotencyReadRefs(refundKey) : null;
 
         await firestoreDb.RunTransactionAsync(async tx =>
         {
-            if (idemRef is not null)
+            if (idemRefs is not null)
             {
-                var idemSnap = await ReadIdempotencyAsync(tx, idemRef, legacyIdemRef!, cancellationToken);
+                var idemSnap = await ReadFirstOwnedIdempotencyAsync(
+                    tx,
+                    idemRefs,
+                    userId,
+                    cancellationToken);
                 if (idemSnap is not null && ReadTimestamp(idemSnap.ToDictionary(), "expiresAt", nowUtc) > nowUtc)
                 {
                     return;
                 }
             }
 
-            var snap = await tx.GetSnapshotAsync(usageRef, cancellationToken);
-            if (!snap.Exists)
+            var snap = await ReadFirstExistingAsync(tx, [usageRef, legacyUsageRef], cancellationToken);
+            if (snap is null)
             {
                 return;
             }
@@ -719,9 +791,12 @@ public sealed class FirestoreQuotaStorage(
         var usageRef = UsageDoc(userId, resource, window);
         await firestoreDb.RunTransactionAsync(async tx =>
         {
-            var snap = await tx.GetSnapshotAsync(usageRef, cancellationToken);
-            var used = snap.Exists ? Math.Max(0, ReadInt(snap.ToDictionary(), "used", 0)) : 0;
-            var distinct = snap.Exists ? ReadStringList(snap.ToDictionary(), "distinctKeys") : [];
+            var snap = await ReadFirstExistingAsync(
+                tx,
+                [usageRef, LegacyUsageDoc(userId, resource, window)],
+                cancellationToken);
+            var used = snap is not null ? Math.Max(0, ReadInt(snap.ToDictionary(), "used", 0)) : 0;
+            var distinct = snap is not null ? ReadStringList(snap.ToDictionary(), "distinctKeys") : [];
             tx.Set(
                 usageRef,
                 BuildUsagePayload(userId, resource, window, used, used, distinct, now),
@@ -772,48 +847,66 @@ public sealed class FirestoreQuotaStorage(
 
         var mergeKey = !string.IsNullOrWhiteSpace(request.IdempotencyKey) ? $"merge_{request.IdempotencyKey}" : null;
         DocumentReference? idemRef = mergeKey is not null ? IdempotencyDoc(mergeKey) : null;
-        DocumentReference? legacyIdemRef = mergeKey is not null ? LegacyIdempotencyDoc(mergeKey) : null;
+        var idemRefs = mergeKey is not null ? IdempotencyReadRefs(mergeKey) : null;
 
         var srcEntRef = EntitlementDoc(request.SourceUserId);
         var tgtEntRef = EntitlementDoc(request.TargetUserId);
 
         return await firestoreDb.RunTransactionAsync(async tx =>
         {
-            if (idemRef is not null)
+            if (idemRefs is not null)
             {
-                var idemSnap = await ReadIdempotencyAsync(tx, idemRef, legacyIdemRef!, cancellationToken);
+                var idemSnap = await ReadFirstExistingAsync(tx, idemRefs, cancellationToken);
                 if (idemSnap is not null)
                 {
-                    return new MergeUserResult(
-                        request.SourceUserId,
-                        request.TargetUserId,
-                        AlreadyMerged: true,
-                        new Dictionary<string, int>(),
-                        new Dictionary<string, int>());
+                    var idemData = idemSnap.ToDictionary();
+                    // An expired record must not suppress a later merge: new credits may have been
+                    // granted after the previous merge and still belong to the target (FIRE-03).
+                    if (ReadTimestamp(idemData, "expiresAt", request.NowUtc) > request.NowUtc)
+                    {
+                        return new MergeUserResult(
+                            request.SourceUserId,
+                            request.TargetUserId,
+                            AlreadyMerged: true,
+                            ReadIntMap(idemData, "transferredUsage"),
+                            ReadIntMap(idemData, "transferredForever"));
+                    }
                 }
             }
 
-            var srcEntSnap = await tx.GetSnapshotAsync(srcEntRef, cancellationToken);
-            var tgtEntSnap = await tx.GetSnapshotAsync(tgtEntRef, cancellationToken);
+            var srcEntSnap = await ReadFirstExistingAsync(
+                tx,
+                [srcEntRef, LegacyEntitlementDoc(request.SourceUserId)],
+                cancellationToken);
+            var tgtEntSnap = await ReadFirstExistingAsync(
+                tx,
+                [tgtEntRef, LegacyEntitlementDoc(request.TargetUserId)],
+                cancellationToken);
 
-            if (srcEntSnap.Exists && IsSnapshotSealed(srcEntSnap.ToDictionary(), request.NowUtc))
+            if (srcEntSnap is not null && IsSnapshotSealed(srcEntSnap.ToDictionary(), request.NowUtc))
             {
                 throw new UserSealedException(request.SourceUserId);
             }
 
-            if (tgtEntSnap.Exists && IsSnapshotSealed(tgtEntSnap.ToDictionary(), request.NowUtc))
+            if (tgtEntSnap is not null && IsSnapshotSealed(tgtEntSnap.ToDictionary(), request.NowUtc))
             {
                 throw new UserSealedException(request.TargetUserId);
             }
 
             // Read all snapshots first (Firestore transaction requirement: reads before writes)
-            var snaps = new List<(MergeItem Item, DocumentReference SrcRef, DocumentReference TgtRef, DocumentSnapshot SrcSnap, DocumentSnapshot TgtSnap)>(request.Items.Count);
+            var snaps = new List<(MergeItem Item, DocumentReference SrcRef, DocumentReference TgtRef, DocumentSnapshot? SrcSnap, DocumentSnapshot? TgtSnap)>(request.Items.Count);
             foreach (var item in request.Items)
             {
                 var srcRef = UsageDoc(request.SourceUserId, item.Resource, item.SourceWindow);
                 var tgtRef = UsageDoc(request.TargetUserId, item.Resource, item.TargetWindow);
-                var srcSnap = await tx.GetSnapshotAsync(srcRef, cancellationToken);
-                var tgtSnap = await tx.GetSnapshotAsync(tgtRef, cancellationToken);
+                var srcSnap = await ReadFirstExistingAsync(
+                    tx,
+                    [srcRef, LegacyUsageDoc(request.SourceUserId, item.Resource, item.SourceWindow)],
+                    cancellationToken);
+                var tgtSnap = await ReadFirstExistingAsync(
+                    tx,
+                    [tgtRef, LegacyUsageDoc(request.TargetUserId, item.Resource, item.TargetWindow)],
+                    cancellationToken);
                 snaps.Add((item, srcRef, tgtRef, srcSnap, tgtSnap));
             }
 
@@ -822,7 +915,7 @@ public sealed class FirestoreQuotaStorage(
 
             foreach (var entry in snaps)
             {
-                if (!entry.SrcSnap.Exists)
+                if (entry.SrcSnap is null)
                 {
                     continue;
                 }
@@ -832,13 +925,13 @@ public sealed class FirestoreQuotaStorage(
                 var srcLimit = ReadInt(srcData, "limit", 0);
                 var srcDistinct = ReadStringList(srcData, "distinctKeys");
 
-                var tgtData = entry.TgtSnap.Exists ? entry.TgtSnap.ToDictionary() : new Dictionary<string, object>();
-                var tgtUsed = entry.TgtSnap.Exists ? ReadInt(tgtData, "used", 0) : 0;
+                var tgtData = entry.TgtSnap is not null ? entry.TgtSnap.ToDictionary() : new Dictionary<string, object>();
+                var tgtUsed = entry.TgtSnap is not null ? ReadInt(tgtData, "used", 0) : 0;
                 // Forever credits are additive: a missing target row starts at 0, not at the source limit.
-                var tgtLimit = entry.TgtSnap.Exists
+                var tgtLimit = entry.TgtSnap is not null
                     ? ReadInt(tgtData, "limit", srcLimit)
                     : (entry.Item.PeriodType == PeriodType.Forever ? 0 : srcLimit);
-                var tgtDistinct = entry.TgtSnap.Exists ? ReadStringList(tgtData, "distinctKeys") : [];
+                var tgtDistinct = entry.TgtSnap is not null ? ReadStringList(tgtData, "distinctKeys") : [];
 
                 if (entry.Item.PeriodType == PeriodType.Forever)
                 {
@@ -864,8 +957,12 @@ public sealed class FirestoreQuotaStorage(
                         .OrderBy(x => x, StringComparer.Ordinal)
                         .ToArray();
 
-                    var newTgtUsed = mergedDistinct.Length > 0
-                        ? mergedDistinct.Length
+                    // A distinct key represents one unit only while every recorded consume charged
+                    // one unit. When either side charged amount > 1, the key count is smaller than
+                    // the used-unit count, so additive accounting is the only safe merge (ISM-01).
+                    var countBased = tgtUsed == tgtDistinct.Count && srcUsed == srcDistinct.Count;
+                    var newTgtUsed = countBased
+                        ? Math.Max(tgtUsed, mergedDistinct.Length)
                         : tgtUsed + srcUsed;
                     var added = Math.Max(0, newTgtUsed - tgtUsed);
 
@@ -889,17 +986,21 @@ public sealed class FirestoreQuotaStorage(
             if (request.SealSource)
             {
                 var sealUntil = request.SealExpiresAtUtc ?? request.NowUtc.AddDays(30);
-                tx.Set(
-                    srcEntRef,
-                    new Dictionary<string, object>
+                // Copy an existing (possibly legacy) entitlement so its tier and subscription
+                // anchor survive the migration instead of being fabricated on every read (FIRE-06).
+                var sealPayload = srcEntSnap is not null
+                    ? srcEntSnap.ToDictionary()
+                    : new Dictionary<string, object>
                     {
-                        ["userId"] = request.SourceUserId,
-                        ["sealed"] = true,
-                        ["migratedTo"] = request.TargetUserId,
-                        ["sealedUntilUtc"] = Timestamp.FromDateTimeOffset(sealUntil),
-                        ["updatedAtUtc"] = Timestamp.FromDateTimeOffset(request.NowUtc)
-                    },
-                    SetOptions.MergeAll);
+                        ["tier"] = "free",
+                        ["subscriptionStartDateUtc"] = Timestamp.FromDateTimeOffset(request.NowUtc)
+                    };
+                sealPayload["userId"] = request.SourceUserId;
+                sealPayload["sealed"] = true;
+                sealPayload["migratedTo"] = request.TargetUserId;
+                sealPayload["sealedUntilUtc"] = Timestamp.FromDateTimeOffset(sealUntil);
+                sealPayload["updatedAtUtc"] = Timestamp.FromDateTimeOffset(request.NowUtc);
+                tx.Set(srcEntRef, sealPayload, SetOptions.MergeAll);
             }
 
             if (idemRef is not null)
@@ -909,6 +1010,9 @@ public sealed class FirestoreQuotaStorage(
                     ["operation"] = "merge_user",
                     ["sourceUserId"] = request.SourceUserId,
                     ["targetUserId"] = request.TargetUserId,
+                    // Persist the counts so an idempotent replay returns the original result (FIRE-04).
+                    ["transferredUsage"] = transferredUsage.ToDictionary(kv => kv.Key, kv => (object)kv.Value),
+                    ["transferredForever"] = transferredForever.ToDictionary(kv => kv.Key, kv => (object)kv.Value),
                     ["expiresAt"] = Timestamp.FromDateTimeOffset(request.NowUtc.AddDays(365)),
                     ["updatedAtUtc"] = Timestamp.FromDateTimeOffset(request.NowUtc)
                 });
@@ -928,8 +1032,10 @@ public sealed class FirestoreQuotaStorage(
         DateTimeOffset nowUtc,
         CancellationToken cancellationToken = default)
     {
-        var snap = await EntitlementDoc(userId).GetSnapshotAsync(cancellationToken);
-        if (!snap.Exists)
+        var snap = await ReadFirstExistingAsync(
+            [EntitlementDoc(userId), LegacyEntitlementDoc(userId)],
+            cancellationToken);
+        if (snap is null)
         {
             return false;
         }
@@ -962,8 +1068,11 @@ public sealed class FirestoreQuotaStorage(
             List<long> globalTicks = [];
             if (globalRef is not null)
             {
-                var globalSnap = await tx.GetSnapshotAsync(globalRef, cancellationToken);
-                if (globalSnap.Exists)
+                var globalSnap = await ReadFirstExistingAsync(
+                    tx,
+                    [globalRef, LegacyRateLimitDoc(resource, "__global__")],
+                    cancellationToken);
+                if (globalSnap is not null)
                 {
                     globalTicks = ReadLongList(globalSnap.ToDictionary(), "ticks")
                         .Where(t => t > cutoffTicks)
@@ -980,7 +1089,10 @@ public sealed class FirestoreQuotaStorage(
                 }
             }
 
-            var clientSnap = await tx.GetSnapshotAsync(clientRef, cancellationToken);
+            var clientSnap = await ReadFirstExistingAsync(
+                tx,
+                [clientRef, LegacyRateLimitDoc(resource, userId)],
+                cancellationToken);
             RateLimitStatus status = config.Algorithm == RateLimitAlgorithm.TokenBucket
                 ? EvaluateFirestoreTokenBucket(tx, clientRef, clientSnap, resource, userId, config, nowUtc, expiresAt)
                 : EvaluateFirestoreSlidingWindow(tx, clientRef, clientSnap, resource, userId, config, nowUtc, cutoffTicks, expiresAt);
@@ -1005,7 +1117,7 @@ public sealed class FirestoreQuotaStorage(
     private static RateLimitStatus EvaluateFirestoreTokenBucket(
         Transaction tx,
         DocumentReference clientRef,
-        DocumentSnapshot clientSnap,
+        DocumentSnapshot? clientSnap,
         string resource,
         string userId,
         RateLimitConfig config,
@@ -1025,7 +1137,7 @@ public sealed class FirestoreQuotaStorage(
         double tokens = capacity;
         long lastRefillTicks = nowTicks;
 
-        if (clientSnap.Exists)
+        if (clientSnap is not null)
         {
             var data = clientSnap.ToDictionary();
             tokens = data.TryGetValue("tokens", out var rawTokens) && rawTokens is not null
@@ -1081,7 +1193,7 @@ public sealed class FirestoreQuotaStorage(
     private static RateLimitStatus EvaluateFirestoreSlidingWindow(
         Transaction tx,
         DocumentReference clientRef,
-        DocumentSnapshot clientSnap,
+        DocumentSnapshot? clientSnap,
         string resource,
         string userId,
         RateLimitConfig config,
@@ -1096,7 +1208,7 @@ public sealed class FirestoreQuotaStorage(
         }
 
         // Prune expired sliding-window timestamps in-place (goquota 9b3a8e2 / FIRESTORE-TTL)
-        var clientTicks = clientSnap.Exists
+        var clientTicks = clientSnap is not null
             ? ReadLongList(clientSnap.ToDictionary(), "ticks")
                 .Where(t => t > cutoffTicks)
                 .OrderBy(t => t)
@@ -1193,14 +1305,31 @@ public sealed class FirestoreQuotaStorage(
         return entries.OrderByDescending(e => e.TimestampUtc).Take(limit).ToArray();
     }
 
+    // User/resource state is keyed by a SHA-256 hash of a delim-joined tuple. The old
+    // "{userId}_{resource}_{period}_{key}" join was not injective ("a_b" + "c" and "a" + "b_c"
+    // produced the same id), so tenants could read and consume each other's quota. The legacy
+    // documents stay readable through the Legacy*Doc methods below; every write goes to the
+    // hashed id, so the first write after a deploy migrates the record.
     private DocumentReference EntitlementDoc(string userId) =>
+        firestoreDb.Collection(_options.EntitlementsCollection)
+            .Document(HashDocId($"ent\u001f{userId}"));
+
+    private DocumentReference LegacyEntitlementDoc(string userId) =>
         firestoreDb.Collection(_options.EntitlementsCollection).Document(SanitizeDocId(userId));
 
     private DocumentReference UsageDoc(string userId, string resource, PeriodWindow window) =>
         firestoreDb.Collection(_options.UsageCollection)
+            .Document(HashDocId($"usage\u001f{userId}\u001f{resource}\u001f{window.PeriodType}\u001f{window.Key}"));
+
+    private DocumentReference LegacyUsageDoc(string userId, string resource, PeriodWindow window) =>
+        firestoreDb.Collection(_options.UsageCollection)
             .Document(SanitizeDocId($"{userId}_{resource}_{window.PeriodType}_{window.Key}"));
 
     private DocumentReference RateLimitDoc(string resource, string userId) =>
+        firestoreDb.Collection(_options.RateLimitsCollection)
+            .Document(HashDocId($"rate\u001f{resource}\u001f{userId}"));
+
+    private DocumentReference LegacyRateLimitDoc(string resource, string userId) =>
         firestoreDb.Collection(_options.RateLimitsCollection)
             .Document(SanitizeDocId($"{resource}_{userId}"));
 
@@ -1215,36 +1344,68 @@ public sealed class FirestoreQuotaStorage(
     private DocumentReference LegacyIdempotencyDoc(string logicalKey) =>
         firestoreDb.Collection(_options.IdempotencyCollection).Document(SanitizeDocId(logicalKey));
 
-    private static async Task<DocumentSnapshot?> ReadIdempotencyAsync(
+    /// <summary>
+    /// Read order for an idempotency record: the current hashed id, then the hashed id of the
+    /// legacy (ambiguous) pre-image, then the pre-hash sanitized id. Callers write to the first
+    /// reference, so a replay also migrates the record to the current id.
+    /// </summary>
+    private DocumentReference[] IdempotencyReadRefs(string primaryKey, params string[] legacyKeys)
+    {
+        var refs = new List<DocumentReference>(1 + (legacyKeys.Length * 2));
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        Add(IdempotencyDoc(primaryKey));
+        foreach (var legacyKey in legacyKeys)
+        {
+            Add(IdempotencyDoc(legacyKey));
+            Add(LegacyIdempotencyDoc(legacyKey));
+        }
+
+        return refs.ToArray();
+
+        void Add(DocumentReference reference)
+        {
+            if (seen.Add(reference.Path))
+            {
+                refs.Add(reference);
+            }
+        }
+    }
+
+    private static async Task<DocumentSnapshot?> ReadFirstExistingAsync(
         Transaction tx,
-        DocumentReference primary,
-        DocumentReference legacy,
+        IReadOnlyList<DocumentReference> refs,
         CancellationToken cancellationToken)
     {
-        var primarySnap = await tx.GetSnapshotAsync(primary, cancellationToken);
-        if (primarySnap.Exists)
+        foreach (var reference in refs)
         {
-            return primarySnap;
+            var snap = await tx.GetSnapshotAsync(reference, cancellationToken);
+            if (snap.Exists)
+            {
+                return snap;
+            }
         }
 
-        var legacySnap = await tx.GetSnapshotAsync(legacy, cancellationToken);
-        return legacySnap.Exists ? legacySnap : null;
+        return null;
     }
 
-    private static async Task<DocumentSnapshot?> ReadIdempotencyAsync(
-        DocumentReference primary,
-        DocumentReference legacy,
+    private static async Task<DocumentSnapshot?> ReadFirstExistingAsync(
+        IReadOnlyList<DocumentReference> refs,
         CancellationToken cancellationToken)
     {
-        var primarySnap = await primary.GetSnapshotAsync(cancellationToken);
-        if (primarySnap.Exists)
+        foreach (var reference in refs)
         {
-            return primarySnap;
+            var snap = await reference.GetSnapshotAsync(cancellationToken);
+            if (snap.Exists)
+            {
+                return snap;
+            }
         }
 
-        var legacySnap = await legacy.GetSnapshotAsync(cancellationToken);
-        return legacySnap.Exists ? legacySnap : null;
+        return null;
     }
+
+    private static bool IsLegacyDocument(DocumentSnapshot snap, DocumentReference primary) =>
+        !string.Equals(snap.Reference.Path, primary.Path, StringComparison.Ordinal);
 
     /// <summary>
     /// Stable, bounded document id for caller-controlled keys (<c>X-Request-ID</c>): SHA-256 hex,
@@ -1256,20 +1417,109 @@ public sealed class FirestoreQuotaStorage(
     private static string SanitizeDocId(string raw) =>
         raw.Replace('/', '_').Replace(' ', '_').Replace(':', '_');
 
-    private static string NormalizeConsumeDocKey(string userId, string idempotencyKey)
-    {
-        var scoped = idempotencyKey.StartsWith($"{userId}:", StringComparison.Ordinal)
+    private static string ConsumeDocKey(string userId, string idempotencyKey) =>
+        $"consume_{QuotaManager.ScopedIdempotencyKey(userId, idempotencyKey)}";
+
+    private static string LegacyConsumeDocKey(string userId, string idempotencyKey) =>
+        $"consume_{LegacyScopedKey(userId, idempotencyKey)}";
+
+    private static string RefundDocKey(string userId, string idempotencyKey) =>
+        $"refund_{QuotaManager.ScopedIdempotencyKey(userId, idempotencyKey)}";
+
+    private static string LegacyRefundDocKey(string userId, string idempotencyKey) =>
+        $"refund_{LegacyScopedKey(userId, idempotencyKey)}";
+
+    // The underscore template stays byte-identical to previous releases: FIRE-05 covers the
+    // consume/refund scope, and changing unrelated money-path ids would force a needless migration.
+    private static string TopUpDocKey(string userId, string resource, string idempotencyKey) =>
+        $"topup_{userId}_{resource}_{idempotencyKey}";
+
+    private static string RefundCreditsDocKey(string userId, string resource, string idempotencyKey) =>
+        $"refund_credits_{userId}_{resource}_{idempotencyKey}";
+
+    /// <summary>
+    /// Pre-fix scope join, kept only to locate records written before the rolling deploy.
+    /// </summary>
+    private static string LegacyScopedKey(string userId, string idempotencyKey) =>
+        idempotencyKey.StartsWith($"{userId}:", StringComparison.Ordinal)
             ? idempotencyKey
             : $"{userId}:{idempotencyKey}";
-        return $"consume_{scoped}";
+
+    /// <summary>
+    /// Parses the current scoped-key format, <c>{escapedUserId}:{escapedKey}</c>, produced by
+    /// <see cref="QuotaManager.ScopedIdempotencyKey"/>. The user id is decoded so ownership can be
+    /// checked, and the pre-fix joined form is reconstructed for the legacy fallback lookup.
+    /// </summary>
+    private static bool TryParseLengthPrefixedScope(
+        string scopedKey,
+        out string userId,
+        out string legacyScope)
+    {
+        userId = string.Empty;
+        legacyScope = string.Empty;
+        var separator = scopedKey.IndexOf(':');
+        if (separator <= 0 || separator == scopedKey.Length - 1)
+        {
+            return false;
+        }
+
+        try
+        {
+            userId = Uri.UnescapeDataString(scopedKey[..separator]);
+            var idempotencyKey = Uri.UnescapeDataString(scopedKey[(separator + 1)..]);
+            legacyScope = LegacyScopedKey(userId, idempotencyKey);
+            return userId.Length > 0;
+        }
+        catch (UriFormatException)
+        {
+            return false;
+        }
     }
 
-    private static string NormalizeRefundDocKey(string userId, string idempotencyKey)
+    /// <summary>
+    /// An idempotency document may only answer for the identity that wrote it. Legacy (ambiguous)
+    /// ids can be shared by two identities; a record without a stored owner is still accepted so a
+    /// replay never turns into a double charge.
+    /// </summary>
+    private static bool IsOwnedBy(DocumentSnapshot snap, string userId)
     {
-        var scoped = idempotencyKey.StartsWith($"{userId}:", StringComparison.Ordinal)
-            ? idempotencyKey
-            : $"{userId}:{idempotencyKey}";
-        return $"refund_{scoped}";
+        var owner = ReadText(snap.ToDictionary(), "userId");
+        return owner.Length == 0 || string.Equals(owner, userId, StringComparison.Ordinal);
+    }
+
+    private static async Task<DocumentSnapshot?> ReadFirstOwnedIdempotencyAsync(
+        Transaction tx,
+        IReadOnlyList<DocumentReference> refs,
+        string userId,
+        CancellationToken cancellationToken)
+    {
+        foreach (var reference in refs)
+        {
+            var snap = await tx.GetSnapshotAsync(reference, cancellationToken);
+            if (snap.Exists && IsOwnedBy(snap, userId))
+            {
+                return snap;
+            }
+        }
+
+        return null;
+    }
+
+    private static async Task<DocumentSnapshot?> ReadFirstOwnedIdempotencyAsync(
+        IReadOnlyList<DocumentReference> refs,
+        string userId,
+        CancellationToken cancellationToken)
+    {
+        foreach (var reference in refs)
+        {
+            var snap = await reference.GetSnapshotAsync(cancellationToken);
+            if (snap.Exists && IsOwnedBy(snap, userId))
+            {
+                return snap;
+            }
+        }
+
+        return null;
     }
 
     private Dictionary<string, object> BuildUsagePayload(
@@ -1404,10 +1654,11 @@ public sealed class FirestoreQuotaStorage(
             dict["timezone"] = ent.Timezone;
         }
 
-        if (ent.ExpiresAtUtc is { } exp)
-        {
-            dict["expiresAtUtc"] = Timestamp.FromDateTimeOffset(exp);
-        }
+        // Always write the field: MergeAll leaves an old timestamp in place when the key is absent,
+        // which silently re-introduces an expiry the caller just cleared (FIRE-02).
+        dict["expiresAtUtc"] = ent.ExpiresAtUtc is { } exp
+            ? Timestamp.FromDateTimeOffset(exp)
+            : FieldValue.Delete;
 
         if (ent.Sealed)
         {
@@ -1440,7 +1691,7 @@ public sealed class FirestoreQuotaStorage(
         var tier = ReadText(data, "tier", "free");
         var subStart = ReadTimestamp(data, "subscriptionStartDateUtc", DateTimeOffset.UtcNow);
         var updated = ReadTimestamp(data, "updatedAtUtc", DateTimeOffset.UtcNow);
-        DateTimeOffset? expires = data.ContainsKey("expiresAtUtc")
+        DateTimeOffset? expires = data.TryGetValue("expiresAtUtc", out var rawExpires) && rawExpires is not null
             ? ReadTimestamp(data, "expiresAtUtc", DateTimeOffset.UtcNow)
             : null;
 
@@ -1542,5 +1793,20 @@ public sealed class FirestoreQuotaStorage(
         return list
             .Select(v => Convert.ToInt64(v, CultureInfo.InvariantCulture))
             .ToArray();
+    }
+
+    private static IReadOnlyDictionary<string, int> ReadIntMap(
+        IDictionary<string, object> data,
+        string key)
+    {
+        if (!data.TryGetValue(key, out var raw) || raw is not IDictionary<string, object> map)
+        {
+            return new Dictionary<string, int>(StringComparer.Ordinal);
+        }
+
+        return map.ToDictionary(
+            kv => kv.Key,
+            kv => Convert.ToInt32(kv.Value, CultureInfo.InvariantCulture),
+            StringComparer.Ordinal);
     }
 }
