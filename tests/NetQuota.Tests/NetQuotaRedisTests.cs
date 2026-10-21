@@ -9,7 +9,6 @@ namespace NetQuota.Tests;
 /// nu există un server Redis:
 ///   docker run -d --rm --name netquota-redis -p 6379:6379 redis:7-alpine
 ///   $env:NETQUOTA_REDIS='localhost:6379'
-///   dotnet test services/Verifio.slnx -c Release --filter "FullyQualifiedName~NetQuotaRedisTests"
 /// </summary>
 public class NetQuotaRedisTests
 {

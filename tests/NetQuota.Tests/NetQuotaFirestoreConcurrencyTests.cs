@@ -9,8 +9,7 @@ namespace NetQuota.Tests;
 /// care rulează în producție. Se auto-skip-uiește când nu există emulator.
 /// Rulează cu:
 ///   gcloud emulators firestore start --host-port=localhost:8085
-///   $env:FIRESTORE_EMULATOR_HOST='localhost:8085'; $env:GOOGLE_CLOUD_PROJECT='demo-verifio'
-///   dotnet test services/Verifio.slnx -c Release
+///   $env:FIRESTORE_EMULATOR_HOST='localhost:8085'; $env:GOOGLE_CLOUD_PROJECT='netquota-demo'
 /// </summary>
 public class NetQuotaFirestoreConcurrencyTests
 {
@@ -311,7 +310,7 @@ public class NetQuotaFirestoreConcurrencyTests
 
         return new FirestoreDbBuilder
         {
-            ProjectId = Environment.GetEnvironmentVariable("GOOGLE_CLOUD_PROJECT") ?? "demo-verifio",
+            ProjectId = Environment.GetEnvironmentVariable("GOOGLE_CLOUD_PROJECT") ?? "netquota-demo",
             EmulatorDetection = Google.Api.Gax.EmulatorDetection.EmulatorOrProduction
         }.Build();
     }

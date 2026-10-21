@@ -9,7 +9,6 @@ namespace NetQuota.Tests;
 ///   docker run -d --rm --name netquota-postgres -p 5433:5432 \
 ///     -e POSTGRES_USER=netquota -e POSTGRES_PASSWORD=netquota -e POSTGRES_DB=netquota postgres:16-alpine
 ///   $env:NETQUOTA_POSTGRES='Host=127.0.0.1;Port=5433;Database=netquota;Username=netquota;Password=netquota'
-///   dotnet test services/Verifio.slnx -c Release --filter "FullyQualifiedName~NetQuotaPostgresTests"
 /// </summary>
 public class NetQuotaPostgresTests
 {

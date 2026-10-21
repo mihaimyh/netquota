@@ -87,7 +87,6 @@ not Redis (same as goquota). See `docs/adapters.md`.
 
 ```csharp
 builder.Services.AddNetQuota(config, _ => new FirestoreQuotaStorage(firestoreDb));
-builder.Services.AddVerifioRateLimiting(); // your own policy names
 
 app.UseRateLimiter();
 
