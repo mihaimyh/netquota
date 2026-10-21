@@ -9,9 +9,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>NetQuota.Billing</PackageId>
-    <Version>1.0.0</Version>
     <Description>Billing webhook integrations for NetQuota: Stripe and RevenueCat parsing, verification, checkout helpers, transfers and rate limiting.</Description>
-    <PackageLicenseExpression>MIT</PackageLicenseExpression>
   </PropertyGroup>
 
 </Project>

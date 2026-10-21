@@ -135,6 +135,7 @@ handled without silently downgrading users. See `docs/billing.md`.
 - [`docs/aspnetcore.md`](docs/aspnetcore.md) — middleware, usage endpoint, headers
 - [`docs/billing.md`](docs/billing.md) — Stripe and RevenueCat integration
 - [`docs/operations.md`](docs/operations.md) — metrics, pruning, failure modes
+- [`docs/publishing.md`](docs/publishing.md) — release tags, GitVersion, NuGet Trusted Publishing
 - [`skills/netquota/SKILL.md`](skills/netquota/SKILL.md) — agent skill
 
 ## Build and test

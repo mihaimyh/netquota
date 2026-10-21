@@ -51,14 +51,19 @@ FIRESTORE_EMULATOR_HOST=127.0.0.1:8085   # optional, Firestore emulator
 
 ## Release
 
-1. Update `<Version>` in `Directory.Build.props`.
-2. `dotnet pack NetQuota.slnx -c Release -o artifacts/packages`
-3. `dotnet nuget push artifacts/packages/*.nupkg --api-key <key> --source https://api.nuget.org/v3/index.json`
-4. `dotnet nuget push artifacts/packages/*.snupkg --api-key <key> --source https://api.nuget.org/v3/index.json`
-5. Tag: `git tag v<version> && git push --tags`
+Tag-driven, versioned by GitVersion (`GitVersion.yml`, `GitHubFlow/v1`, tag prefix `v`).
+There is no `<Version>` in the source.
 
-Consumers install `NetQuota`, `NetQuota.Firestore`, `NetQuota.Redis`, `NetQuota.Postgres`,
-`NetQuota.AspNetCore`, `NetQuota.Billing`.
+1. `git tag v1.2.3 && git push origin v1.2.3`
+2. `.github/workflows/release.yml` builds, tests, packs one package per project, exchanges a GitHub
+   OIDC token for a short-lived NuGet key (`NuGet/login@v1`) and pushes to nuget.org.
+3. The workflow also creates the GitHub release with the `.nupkg`/`.snupkg` artifacts.
+
+One-time setup: a nuget.org Trusted Publishing policy (owner `mihaimyh`, repo `netquota`, workflow
+file `release.yml`, no environment) and the `NUGET_USER` GitHub secret with the nuget.org profile
+name. See `docs/publishing.md`.
+
+Manual fallback (API key) and local packing instructions are in the same document.
 
 ## Change policy
 

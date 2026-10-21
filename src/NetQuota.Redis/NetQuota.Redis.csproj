@@ -13,9 +13,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>NetQuota.Redis</PackageId>
-    <Version>1.0.0</Version>
     <Description>Redis storage adapter for NetQuota using atomic Lua scripts for quotas, pre-paid credits, promotions and rate limiting.</Description>
-    <PackageLicenseExpression>MIT</PackageLicenseExpression>
   </PropertyGroup>
 
 </Project>

@@ -1,0 +1,32 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 11.0.x
+          dotnet-quality: preview
+
+      - name: Restore
+        run: dotnet restore NetQuota.slnx
+
+      - name: Build
+        run: dotnet build NetQuota.slnx -c Release --no-restore
+
+      - name: Test
+        # Redis/Postgres/Firestore suites skip themselves when no server is configured.
+        run: dotnet test NetQuota.slnx -c Release --no-build

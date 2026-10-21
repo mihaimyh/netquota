@@ -13,9 +13,7 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <Nullable>enable</Nullable>
     <PackageId>NetQuota.Postgres</PackageId>
-    <Version>1.0.0</Version>
     <Description>PostgreSQL storage adapter for NetQuota with row-locked transactions, promotions, pre-paid credits, cross-identity merges and audit logs.</Description>
-    <PackageLicenseExpression>MIT</PackageLicenseExpression>
   </PropertyGroup>
 
 </Project>

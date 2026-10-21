@@ -1,0 +1,91 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write   # create the GitHub release
+  id-token: write   # OIDC token for NuGet Trusted Publishing
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # GitVersion needs tags and full history
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 11.0.x
+          dotnet-quality: preview
+
+      - name: Setup GitVersion
+        uses: gittools/actions/gitversion/setup@v3
+        with:
+          versionSpec: '6.x'
+
+      - name: Determine version
+        id: gitversion
+        uses: gittools/actions/gitversion/execute@v3
+
+      - name: Show version
+        run: echo "Packing ${{ steps.gitversion.outputs.semVer }} (full ${{ steps.gitversion.outputs.fullSemVer }})"
+
+      - name: Restore
+        run: dotnet restore NetQuota.slnx
+
+      - name: Build
+        run: dotnet build NetQuota.slnx -c Release --no-restore -p:Version=${{ steps.gitversion.outputs.semVer }}
+
+      - name: Test
+        run: dotnet test NetQuota.slnx -c Release --no-build
+
+      - name: Pack
+        # Every packable csproj produces its own package (six in total).
+        run: dotnet pack NetQuota.slnx -c Release --no-build -o artifacts/packages -p:Version=${{ steps.gitversion.outputs.semVer }}
+
+      - name: Verify packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          packages=(artifacts/packages/*.nupkg)
+          if [ "${#packages[@]}" -ne 6 ]; then
+            echo "Expected 6 packages, found ${#packages[@]}" >&2
+            printf '%s\n' "${packages[@]}" >&2
+            exit 1
+          fi
+          printf '%s\n' "${packages[@]}"
+
+      - name: NuGet login (OIDC -> short-lived API key)
+        id: login
+        uses: NuGet/login@v1
+        with:
+          # nuget.org profile name, not the email address
+          user: ${{ secrets.NUGET_USER }}
+
+      - name: Push packages to nuget.org
+        run: |
+          dotnet nuget push "artifacts/packages/*.nupkg" \
+            --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate
+          dotnet nuget push "artifacts/packages/*.snupkg" \
+            --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" \
+            --source https://api.nuget.org/v3/index.json \
+            --skip-duplicate
+
+      - name: Upload packages
+        uses: actions/upload-artifact@v4
+        with:
+          name: nuget-packages-${{ steps.gitversion.outputs.semVer }}
+          path: artifacts/packages/*
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/packages/*
+          generate_release_notes: true
