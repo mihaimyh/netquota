@@ -628,6 +628,8 @@ public sealed class TieredQuotaStorage :
     private readonly Channel<StorageConsumeSpec>? _coldSyncQueue;
     private readonly Task? _coldSyncPump;
     private readonly CancellationTokenSource? _coldSyncCts;
+    private int _pendingColdWrites;
+    private TaskCompletionSource _coldIdlePulse = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public TieredQuotaStorage(TieredQuotaStorageConfig config)
     {
@@ -648,7 +650,7 @@ public sealed class TieredQuotaStorage :
             {
                 SingleReader = true,
                 SingleWriter = false,
-                FullMode = BoundedChannelFullMode.DropWrite
+                FullMode = BoundedChannelFullMode.Wait
             });
         _coldSyncCts = new CancellationTokenSource();
         _coldSyncPump = Task.Run(() => PumpColdSyncAsync(_coldSyncQueue.Reader, _coldSyncCts.Token));
@@ -696,11 +698,23 @@ public sealed class TieredQuotaStorage :
                 {
                     _config.AsyncErrorHandler?.Invoke(ex);
                 }
+                finally
+                {
+                    CompletePendingColdWrite();
+                }
             }
         }
         catch (OperationCanceledException)
         {
             // Shutdown with a full queue: pending cold writes were already reported as dropped.
+        }
+        finally
+        {
+            // The pump will not apply anything else; release readers that wait for cold to catch up.
+            if (Interlocked.Exchange(ref _pendingColdWrites, 0) > 0)
+            {
+                PulseColdIdle();
+            }
         }
     }
 
@@ -771,6 +785,9 @@ public sealed class TieredQuotaStorage :
         int defaultLimit,
         CancellationToken cancellationToken = default)
     {
+        // In async mode hot is authoritative for consumption, so cold must have applied every queued
+        // write before its snapshot can be copied back into hot. Otherwise the read erases a consume.
+        await WaitForColdSyncIdleAsync(cancellationToken);
         var cold = await _config.Cold.GetUsageAsync(userId, resource, window, defaultLimit, cancellationToken);
         if (cold is not null)
         {
@@ -801,7 +818,7 @@ public sealed class TieredQuotaStorage :
 
         var hotOutcome = await _config.Hot.TryConsumeAsync(spec, cancellationToken);
         if (_coldSyncQueue is not null &&
-            !_coldSyncQueue.Writer.TryWrite(spec))
+            !EnqueueColdSync(spec))
         {
             _config.AsyncErrorHandler?.Invoke(
                 new QuotaException("Cold usage sync queue is full; the consumption was not mirrored to cold storage."));
@@ -810,10 +827,58 @@ public sealed class TieredQuotaStorage :
         return hotOutcome;
     }
 
+    private bool EnqueueColdSync(StorageConsumeSpec spec)
+    {
+        Interlocked.Increment(ref _pendingColdWrites);
+        if (_coldSyncQueue!.Writer.TryWrite(spec))
+        {
+            return true;
+        }
+
+        CompletePendingColdWrite();
+        return false;
+    }
+
+    private void CompletePendingColdWrite()
+    {
+        if (Interlocked.Decrement(ref _pendingColdWrites) > 0)
+        {
+            return;
+        }
+
+        PulseColdIdle();
+    }
+
+    private void PulseColdIdle() =>
+        Interlocked.Exchange(
+                ref _coldIdlePulse,
+                new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously))
+            .TrySetResult();
+
+    private async Task WaitForColdSyncIdleAsync(CancellationToken cancellationToken)
+    {
+        if (_coldSyncQueue is null)
+        {
+            return;
+        }
+
+        while (Volatile.Read(ref _pendingColdWrites) > 0)
+        {
+            var pulse = Volatile.Read(ref _coldIdlePulse);
+            if (Volatile.Read(ref _pendingColdWrites) <= 0)
+            {
+                return;
+            }
+
+            await pulse.Task.WaitAsync(cancellationToken);
+        }
+    }
+
     public async Task ApplyTierChangeAsync(
         TierChangeRequest request,
         CancellationToken cancellationToken = default)
     {
+        await WaitForColdSyncIdleAsync(cancellationToken);
         await _config.Cold.ApplyTierChangeAsync(request, cancellationToken);
         await _config.Hot.ApplyTierChangeAsync(request, cancellationToken);
     }
@@ -827,6 +892,7 @@ public sealed class TieredQuotaStorage :
         IReadOnlyList<string>? distinctKeys = null,
         CancellationToken cancellationToken = default)
     {
+        await WaitForColdSyncIdleAsync(cancellationToken);
         await _config.Cold.SetUsageAsync(userId, resource, window, used, limit, distinctKeys, cancellationToken);
         await _config.Hot.SetUsageAsync(userId, resource, window, used, limit, distinctKeys, cancellationToken);
     }
@@ -839,6 +905,8 @@ public sealed class TieredQuotaStorage :
         DateTimeOffset nowUtc,
         CancellationToken cancellationToken = default)
     {
+        // Cold must not see this refund before the queued consumes that created the usage.
+        await WaitForColdSyncIdleAsync(cancellationToken);
         var outcome = await _config.Cold.RefundAsync(request, window, defaultLimit, idempotencyTtl, nowUtc, cancellationToken);
         await _config.Hot.RefundAsync(request, window, defaultLimit, idempotencyTtl, nowUtc, cancellationToken);
         return outcome;
@@ -881,6 +949,7 @@ public sealed class TieredQuotaStorage :
         DateTimeOffset nowUtc,
         CancellationToken cancellationToken = default)
     {
+        await WaitForColdSyncIdleAsync(cancellationToken);
         await _config.Cold.TopUpForeverCreditsAsync(userId, resource, amount, idempotencyKey, idempotencyTtl, nowUtc, cancellationToken);
         await _config.Hot.TopUpForeverCreditsAsync(userId, resource, amount, idempotencyKey, idempotencyTtl, nowUtc, cancellationToken);
     }
@@ -894,6 +963,7 @@ public sealed class TieredQuotaStorage :
         DateTimeOffset nowUtc,
         CancellationToken cancellationToken = default)
     {
+        await WaitForColdSyncIdleAsync(cancellationToken);
         await _config.Cold.RefundForeverCreditsAsync(userId, resource, amount, idempotencyKey, idempotencyTtl, nowUtc, cancellationToken);
         await _config.Hot.RefundForeverCreditsAsync(userId, resource, amount, idempotencyKey, idempotencyTtl, nowUtc, cancellationToken);
     }
@@ -905,6 +975,7 @@ public sealed class TieredQuotaStorage :
         int defaultLimit,
         CancellationToken cancellationToken = default)
     {
+        await WaitForColdSyncIdleAsync(cancellationToken);
         await _config.Cold.DrainRemainingAsync(userId, resource, window, defaultLimit, cancellationToken);
         await _config.Hot.DrainRemainingAsync(userId, resource, window, defaultLimit, cancellationToken);
     }
@@ -918,6 +989,7 @@ public sealed class TieredQuotaStorage :
             throw new UnsupportedQuotaOperationException("MergeUser");
         }
 
+        await WaitForColdSyncIdleAsync(cancellationToken);
         var res = await coldMerger.MergeUserAsync(request, cancellationToken);
         await hotMerger.MergeUserAsync(request, cancellationToken);
         return res;
@@ -929,6 +1001,7 @@ public sealed class TieredQuotaStorage :
         DateTimeOffset nowUtc,
         CancellationToken cancellationToken = default)
     {
+        await WaitForColdSyncIdleAsync(cancellationToken);
         var res = await _config.Cold.MergeUserAsync(request, windowResolver, nowUtc, cancellationToken);
         await _config.Hot.MergeUserAsync(request, windowResolver, nowUtc, cancellationToken);
         return res;
