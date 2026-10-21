@@ -7,6 +7,9 @@
     <IsPackable>false</IsPackable>
     <OutputType>Exe</OutputType>
     <IsTestProject>true</IsTestProject>
+    <!-- xUnit1051 pre-dates this change set (the repository keeps a large backlog); the suite must
+         still build with -warnaserror. New tests pass TestContext.Current.CancellationToken. -->
+    <NoWarn>$(NoWarn);xUnit1051</NoWarn>
   </PropertyGroup>
 
   <ItemGroup>

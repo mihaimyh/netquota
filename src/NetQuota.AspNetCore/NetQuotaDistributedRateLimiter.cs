@@ -9,10 +9,18 @@ namespace NetQuota.AspNetCore;
 /// <see cref="System.Threading.RateLimiting.RateLimiter"/> so <c>.RequireRateLimiting(policy)</c>
 /// can evaluate distributed windows in Firestore (or in-memory) transparently.
 /// </summary>
+/// <remarks>
+/// <c>explicitTier</c> is an optional tier override. When it is <c>null</c> (the default) the
+/// subject's entitlement is resolved and its effective tier is used, falling back to
+/// <see cref="QuotaConfig.DefaultTier"/>. Weighted acquisitions charge one window slot per permit;
+/// the charge is not transactional, so a multi-permit acquisition denied part way through keeps the
+/// permits it already charged consumed.
+/// </remarks>
 public sealed class NetQuotaDistributedRateLimiter(
     QuotaManager manager,
     string resource,
-    string subjectKey) : RateLimiter
+    string subjectKey,
+    string? explicitTier = null) : RateLimiter
 {
     public override TimeSpan? IdleDuration => TimeSpan.Zero;
 
@@ -25,13 +33,36 @@ public sealed class NetQuotaDistributedRateLimiter(
         int permitCount,
         CancellationToken cancellationToken)
     {
-        var status = await manager.CheckRateLimitAsync(
-            subjectKey,
-            resource,
-            explicitTier: "ANONYMOUS",
-            cancellationToken);
+        ArgumentOutOfRangeException.ThrowIfNegative(permitCount);
 
-        return new NetQuotaRateLimitLease(status);
+        if (permitCount == 0)
+        {
+            return new NetQuotaRateLimitLease(
+                new RateLimitStatus(true, int.MaxValue, int.MaxValue, DateTimeOffset.UtcNow, TimeSpan.Zero));
+        }
+
+        RateLimitStatus? status = null;
+        for (var permit = 0; permit < permitCount; permit++)
+        {
+            status = await manager.CheckRateLimitAsync(
+                subjectKey,
+                resource,
+                explicitTier,
+                cancellationToken);
+
+            if (!status.Allowed)
+            {
+                return new NetQuotaRateLimitLease(status);
+            }
+
+            if (status.Limit == int.MaxValue)
+            {
+                // No window is configured for the subject's tier, so every remaining permit fits.
+                return new NetQuotaRateLimitLease(status);
+            }
+        }
+
+        return new NetQuotaRateLimitLease(status!);
     }
 
     private sealed class NetQuotaRateLimitLease(RateLimitStatus status) : RateLimitLease
