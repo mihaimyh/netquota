@@ -874,6 +874,7 @@ public sealed class QuotaManager
             throw new QuotaConfigValidationException("TopUp amount must be positive.");
         }
 
+        RequireIdempotencyKey(idempotencyKey);
         var now = await GetNowUtcAsync(cancellationToken);
         await _storage.TopUpForeverCreditsAsync(userId, resource, amount, idempotencyKey, _config.IdempotencyTtl, now, cancellationToken);
         InvalidateUsageCache(userId, resource, PeriodWindow.Forever);
@@ -892,6 +893,7 @@ public sealed class QuotaManager
             throw new QuotaConfigValidationException("RefundCredits amount must be positive.");
         }
 
+        RequireIdempotencyKey(idempotencyKey);
         var now = await GetNowUtcAsync(cancellationToken);
         await _storage.RefundForeverCreditsAsync(userId, resource, amount, idempotencyKey, _config.IdempotencyTtl, now, cancellationToken);
         InvalidateUsageCache(userId, resource, PeriodWindow.Forever);
@@ -932,10 +934,20 @@ public sealed class QuotaManager
         string? idempotencyKey = null,
         CancellationToken cancellationToken = default)
     {
+        RequireIdempotencyKey(idempotencyKey);
         var now = await GetNowUtcAsync(cancellationToken);
         await _storage.TopUpForeverCreditsAsync(userId, resource, amount, idempotencyKey, _config.IdempotencyTtl, now, cancellationToken);
         InvalidateUsageCache(userId, resource, PeriodWindow.Forever);
         await WriteAuditAsync(userId, resource, "admin_grant_credit", amount, reason, now, cancellationToken);
+    }
+
+    private static void RequireIdempotencyKey(string? idempotencyKey)
+    {
+        if (string.IsNullOrWhiteSpace(idempotencyKey))
+        {
+            throw new QuotaConfigValidationException(
+                "An idempotency key derived from the provider event id is required for credit grants and refunds.");
+        }
     }
 
     public async Task DrainRemainingAsync(

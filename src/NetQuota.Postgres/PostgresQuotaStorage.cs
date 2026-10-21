@@ -397,7 +397,7 @@ public sealed partial class PostgresQuotaStorage :
         var clamped = Math.Max(0, amount);
         var recordKey = string.IsNullOrWhiteSpace(idempotencyKey)
             ? null
-            : $"topup:{userId}:{idempotencyKey}";
+            : $"topup:{userId}:{resource}:{idempotencyKey}";
 
         if (recordKey is not null)
         {
@@ -454,7 +454,7 @@ public sealed partial class PostgresQuotaStorage :
         var clamped = Math.Max(0, amount);
         var recordKey = string.IsNullOrWhiteSpace(idempotencyKey)
             ? null
-            : $"refund_credits:{userId}:{idempotencyKey}";
+            : $"refund_credits:{userId}:{resource}:{idempotencyKey}";
 
         if (recordKey is not null)
         {

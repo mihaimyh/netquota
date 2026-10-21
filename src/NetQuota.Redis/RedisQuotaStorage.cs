@@ -462,7 +462,7 @@ public sealed partial class RedisQuotaStorage :
 
         var topUpKey = string.IsNullOrWhiteSpace(idempotencyKey)
             ? string.Empty
-            : RecordKey($"topup:{userId}:{idempotencyKey}");
+            : RecordKey($"topup:{userId}:{resource}:{idempotencyKey}");
 
         await _db.ScriptEvaluateAsync(
             TopUpScript,
@@ -483,7 +483,7 @@ public sealed partial class RedisQuotaStorage :
 
         var refundKey = string.IsNullOrWhiteSpace(idempotencyKey)
             ? string.Empty
-            : RecordKey($"refund_credits:{userId}:{idempotencyKey}");
+            : RecordKey($"refund_credits:{userId}:{resource}:{idempotencyKey}");
 
         await _db.ScriptEvaluateAsync(
             RefundCreditsScript,

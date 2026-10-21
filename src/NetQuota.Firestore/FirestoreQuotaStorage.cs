@@ -611,7 +611,7 @@ public sealed class FirestoreQuotaStorage(
         CancellationToken cancellationToken = default)
     {
         var usageRef = UsageDoc(userId, resource, PeriodWindow.Forever);
-        var topUpKey = !string.IsNullOrWhiteSpace(idempotencyKey) ? $"topup_{userId}_{idempotencyKey}" : null;
+        var topUpKey = !string.IsNullOrWhiteSpace(idempotencyKey) ? $"topup_{userId}_{resource}_{idempotencyKey}" : null;
         DocumentReference? idemRef = topUpKey is not null ? IdempotencyDoc(topUpKey) : null;
         DocumentReference? legacyIdemRef = topUpKey is not null ? LegacyIdempotencyDoc(topUpKey) : null;
 
@@ -659,7 +659,7 @@ public sealed class FirestoreQuotaStorage(
         CancellationToken cancellationToken = default)
     {
         var usageRef = UsageDoc(userId, resource, PeriodWindow.Forever);
-        var refundKey = !string.IsNullOrWhiteSpace(idempotencyKey) ? $"refund_credits_{userId}_{idempotencyKey}" : null;
+        var refundKey = !string.IsNullOrWhiteSpace(idempotencyKey) ? $"refund_credits_{userId}_{resource}_{idempotencyKey}" : null;
         DocumentReference? idemRef = refundKey is not null ? IdempotencyDoc(refundKey) : null;
         DocumentReference? legacyIdemRef = refundKey is not null ? LegacyIdempotencyDoc(refundKey) : null;
 

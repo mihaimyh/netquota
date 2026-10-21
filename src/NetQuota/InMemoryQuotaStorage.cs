@@ -413,7 +413,7 @@ public sealed class InMemoryQuotaStorage(Func<DateTimeOffset>? clock = null)
         {
             if (!string.IsNullOrWhiteSpace(idempotencyKey))
             {
-                var idemKey = $"topup:{userId}:{idempotencyKey}";
+                var idemKey = $"topup:{userId}:{resource}:{idempotencyKey}";
                 if (_idempotency.TryGetValue(idemKey, out var cached) && cached.ExpiresAtUtc > nowUtc)
                 {
                     return Task.CompletedTask;
@@ -445,7 +445,7 @@ public sealed class InMemoryQuotaStorage(Func<DateTimeOffset>? clock = null)
         {
             if (!string.IsNullOrWhiteSpace(idempotencyKey))
             {
-                var idemKey = $"refund_credits:{userId}:{idempotencyKey}";
+                var idemKey = $"refund_credits:{userId}:{resource}:{idempotencyKey}";
                 if (_idempotency.TryGetValue(idemKey, out var cached) && cached.ExpiresAtUtc > nowUtc)
                 {
                     return Task.CompletedTask;
