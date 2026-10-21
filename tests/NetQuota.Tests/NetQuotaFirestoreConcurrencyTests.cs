@@ -13,16 +13,17 @@ namespace NetQuota.Tests;
 /// </summary>
 public class NetQuotaFirestoreConcurrencyTests
 {
+    private const string FirestoreNotConfigured =
+        "FIRESTORE_EMULATOR_HOST is not set; Firestore integration tests are skipped.";
+
     private static readonly TimeZoneInfo Bucharest = TimeZoneInfo.FindSystemTimeZoneById("Europe/Bucharest");
 
     [Fact]
     public async Task ConcurrentConsumeAndRefund_LeavesTheCounterConsistent()
     {
-        var db = TryCreateEmulatorDb();
-        if (db is null)
-        {
-            return;
-        }
+        var maybeDb = TryCreateEmulatorDb();
+        Assert.SkipWhen(maybeDb is null, FirestoreNotConfigured);
+        var db = maybeDb!;
 
         var storage = new FirestoreQuotaStorage(db);
         var now = DateTimeOffset.UtcNow;
@@ -95,11 +96,9 @@ public class NetQuotaFirestoreConcurrencyTests
     [Fact]
     public async Task ApplyTierChange_StoresProratedLimit_AndConsumePreservesIt()
     {
-        var db = TryCreateEmulatorDb();
-        if (db is null)
-        {
-            return;
-        }
+        var maybeDb = TryCreateEmulatorDb();
+        Assert.SkipWhen(maybeDb is null, FirestoreNotConfigured);
+        var db = maybeDb!;
 
         var storage = new FirestoreQuotaStorage(db);
         var userId = $"u_{Guid.NewGuid():N}";
@@ -151,11 +150,9 @@ public class NetQuotaFirestoreConcurrencyTests
     [Fact]
     public async Task Promotion_SetAndClear_LeavesBaseFieldsUntouched()
     {
-        var db = TryCreateEmulatorDb();
-        if (db is null)
-        {
-            return;
-        }
+        var maybeDb = TryCreateEmulatorDb();
+        Assert.SkipWhen(maybeDb is null, FirestoreNotConfigured);
+        var db = maybeDb!;
 
         var storage = new FirestoreQuotaStorage(db);
         var userId = $"u_{Guid.NewGuid():N}";
@@ -193,11 +190,9 @@ public class NetQuotaFirestoreConcurrencyTests
     [Fact]
     public async Task Idempotency_UsesHashedDocIds_AndRoundTripsForeverPeriod()
     {
-        var db = TryCreateEmulatorDb();
-        if (db is null)
-        {
-            return;
-        }
+        var maybeDb = TryCreateEmulatorDb();
+        Assert.SkipWhen(maybeDb is null, FirestoreNotConfigured);
+        var db = maybeDb!;
 
         var storage = new FirestoreQuotaStorage(db);
         var userId = $"u_{Guid.NewGuid():N}";
@@ -244,11 +239,9 @@ public class NetQuotaFirestoreConcurrencyTests
     [Fact]
     public async Task Idempotency_ReadsLegacyDocIdDuringRollout()
     {
-        var db = TryCreateEmulatorDb();
-        if (db is null)
-        {
-            return;
-        }
+        var maybeDb = TryCreateEmulatorDb();
+        Assert.SkipWhen(maybeDb is null, FirestoreNotConfigured);
+        var db = maybeDb!;
 
         var storage = new FirestoreQuotaStorage(db);
         var userId = $"u_{Guid.NewGuid():N}";
