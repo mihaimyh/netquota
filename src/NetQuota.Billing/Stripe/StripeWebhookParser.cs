@@ -183,6 +183,35 @@ public static class StripeWebhookParser
 
         if (string.IsNullOrWhiteSpace(userId) || string.IsNullOrWhiteSpace(resource) || packCredits is null or <= 0)
         {
+            if (kind == BillingWebhookKind.Refund && !string.IsNullOrWhiteSpace(userId))
+            {
+                // Refund pentru un produs care nu e credit-pack: nu există credite de revertit, dar
+                // consumerul trebuie să afle, ca să-și revoce propriul Drept.
+                return new BillingWebhookResult(BillingWebhookKind.PaymentRefunded, new BillingWebhookEvent
+                {
+                    UserId = userId,
+                    NewTier = options.DefaultTier,
+                    Provider = "stripe",
+                    EventType = type,
+                    EventId = eventId,
+                    ProviderObjectId = Text(obj, "id") ?? string.Empty,
+                    PaymentIntentId = Text(obj, "payment_intent") ?? Text(obj, "id") ?? string.Empty,
+                    EventTimestamp = timestamp,
+                    ProductId = Text(metadata, "price_id") ?? string.Empty,
+                    Store = "stripe",
+                    Currency = (Text(obj, "currency") ?? string.Empty).ToUpperInvariant(),
+                    PriceCents = Long(obj, amountField) ?? Long(obj, "amount_refunded") ?? 0,
+                    CancelAtPeriodEnd = null,
+                    Metadata = new Dictionary<string, string>(StringComparer.Ordinal)
+                    {
+                        ["cui"] = Text(metadata, "cui") ?? string.Empty,
+                        ["targetCui"] = Text(metadata, "targetCui") ?? string.Empty,
+                        ["planCode"] = Text(metadata, "planCode") ?? string.Empty,
+                        ["productType"] = Text(metadata, "productType") ?? string.Empty
+                    }
+                });
+            }
+
             // Refunds of subscription invoices must not touch prepaid credits.
             return BillingWebhookResult.Ignored(kind == BillingWebhookKind.Refund
                 ? "refund without credit-pack metadata"
@@ -254,6 +283,8 @@ public static class StripeWebhookParser
             Provider = "stripe",
             EventType = type,
             EventId = identity,
+            ProviderObjectId = Text(obj, "id") ?? string.Empty,
+            PaymentIntentId = Text(obj, "payment_intent") ?? Text(obj, "id") ?? string.Empty,
             EventTimestamp = timestamp,
             ProductId = Text(metadata, "price_id") ?? string.Empty,
             Store = "stripe",
@@ -314,6 +345,7 @@ public static class StripeWebhookParser
             EventType = type,
             EventId = eventId,
             ProviderObjectId = Text(obj, "id") ?? string.Empty,
+            PaymentIntentId = Text(obj, "payment_intent") ?? string.Empty,
             EventTimestamp = timestamp,
             ProductId = metadata.GetValueOrDefault("product_id", string.Empty),
             Store = "stripe",

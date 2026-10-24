@@ -81,6 +81,34 @@ public class StripeHostedCheckoutTests
 
     // ---------- checkout.session.completed parsing ----------
 
+    /// <summary>Refund-ul vine cu `payment_intent`, nu cu sesiunea: doar el leagă banii de cumpărare.</summary>
+    [Fact]
+    public void StripeParser_ChargeRefunded_CarriesThePaymentIntent()
+    {
+        const string json = """
+            {
+              "id": "evt_refund_1",
+              "object": "event",
+              "created": 1760000600,
+              "type": "charge.refunded",
+              "data": {
+                "object": {
+                  "id": "ch_1",
+                  "payment_intent": "pi_test_refund",
+                  "amount_refunded": 4900,
+                  "currency": "ron",
+                  "metadata": { "user_id": "u1" }
+                }
+              }
+            }
+            """;
+
+        var result = Parse(json);
+
+        Assert.Equal(BillingWebhookKind.PaymentRefunded, result.Kind);
+        Assert.Equal("pi_test_refund", result.Event!.PaymentIntentId);
+    }
+
     private const string CheckoutCompletedJson = """
         {
           "id": "evt_checkout_1",
@@ -99,6 +127,7 @@ public class StripeHostedCheckoutTests
               "currency": "ron",
               "customer": "cus_1",
               "customer_email": "buyer@example.test",
+              "payment_intent": "pi_test_a1",
               "metadata": {
                 "user_id": "u1",
                 "product_id": "prod_report",
@@ -131,6 +160,7 @@ public class StripeHostedCheckoutTests
         Assert.Equal("checkout.session.completed", evt.EventType);
         Assert.Equal("evt_checkout_1", evt.EventId);
         Assert.Equal("cs_test_a1", evt.ProviderObjectId);
+        Assert.Equal("pi_test_a1", evt.PaymentIntentId);
         Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(1760000500), evt.EventTimestamp);
         Assert.Equal("ron", evt.Currency);
         Assert.Equal(4900, evt.PriceCents);

@@ -51,6 +51,12 @@ public sealed record BillingWebhookEvent
     /// </summary>
     public string ProviderObjectId { get; init; } = string.Empty;
 
+    /// <summary>
+    /// Stripe <c>PaymentIntent</c> (<c>pi_...</c>) behind the money, when the event carries one. It is
+    /// the only key that ties a refund back to the purchase that granted a product.
+    /// </summary>
+    public string PaymentIntentId { get; init; } = string.Empty;
+
     public DateTimeOffset EventTimestamp { get; init; } = DateTimeOffset.UnixEpoch;
 
     public string ProductId { get; init; } = string.Empty;
@@ -90,7 +96,13 @@ public enum BillingWebhookKind
     /// Subscription-mode sessions are ignored because <c>customer.subscription.*</c> owns the tier,
     /// and unpaid sessions (delayed payment methods) are ignored too.
     /// </summary>
-    CheckoutCompleted
+    CheckoutCompleted,
+
+    /// <summary>
+    /// Bani returnați pentru un produs care nu e credit-pack (raport, deblocare, serviciu). Consumerul
+    /// decide ce revocă; <see cref="BillingWebhookEvent.PaymentIntentId"/> leagă refund-ul de cumpărare.
+    /// </summary>
+    PaymentRefunded
 }
 
 public sealed record BillingWebhookResult(
