@@ -313,6 +313,7 @@ public static class StripeWebhookParser
             Provider = "stripe",
             EventType = type,
             EventId = eventId,
+            ProviderObjectId = Text(obj, "id") ?? string.Empty,
             EventTimestamp = timestamp,
             ProductId = metadata.GetValueOrDefault("product_id", string.Empty),
             Store = "stripe",

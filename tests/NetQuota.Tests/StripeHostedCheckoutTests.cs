@@ -130,6 +130,7 @@ public class StripeHostedCheckoutTests
         Assert.Equal("stripe", evt.Store);
         Assert.Equal("checkout.session.completed", evt.EventType);
         Assert.Equal("evt_checkout_1", evt.EventId);
+        Assert.Equal("cs_test_a1", evt.ProviderObjectId);
         Assert.Equal(DateTimeOffset.FromUnixTimeSeconds(1760000500), evt.EventTimestamp);
         Assert.Equal("ron", evt.Currency);
         Assert.Equal(4900, evt.PriceCents);

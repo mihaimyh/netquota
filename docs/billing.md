@@ -129,6 +129,7 @@ optional `customer_email` instead), so nothing is written to `IBillingCustomerSt
 | --- | --- |
 | `UserId` | `metadata[user_id]`, falling back to `client_reference_id`; both missing → `Ignored("missing user id")` |
 | `EventId` / `EventTimestamp` | the event root's `id` / `created` (dedupe key) |
+| `ProviderObjectId` | `data.object.id` — the Checkout Session (`cs_...`), for receipts and reconciliation |
 | `Currency` / `PriceCents` | `currency` (lowercase, unlike subscription events) / `amount_total` |
 | `ProductId` / `NewTier` | `metadata[product_id]` (empty when absent) / `metadata[tier]` or `""` |
 | `Metadata` | the session's metadata dictionary, verbatim — keys are the caller's, never interpreted |

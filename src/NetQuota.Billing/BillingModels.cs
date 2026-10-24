@@ -43,6 +43,14 @@ public sealed record BillingWebhookEvent
 
     /// <summary>Provider event id (Stripe <c>evt_...</c>, RevenueCat <c>event.id</c>) for deduplication.</summary>
     public string EventId { get; init; } = string.Empty;
+
+    /// <summary>
+    /// Identifier of the provider object the event describes (Stripe <c>cs_...</c> for
+    /// <c>checkout.session.completed</c>; empty when the event carries none). Consumers key their own
+    /// receipts on it, so it must not be confused with <see cref="EventId"/>.
+    /// </summary>
+    public string ProviderObjectId { get; init; } = string.Empty;
+
     public DateTimeOffset EventTimestamp { get; init; } = DateTimeOffset.UnixEpoch;
 
     public string ProductId { get; init; } = string.Empty;
