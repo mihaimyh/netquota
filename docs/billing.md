@@ -102,6 +102,13 @@ var session = await stripe.CreateHostedCheckoutAsync(new StripeCheckoutRequest
 return Results.Redirect(session.Url);          // session.SessionId for reconciliation
 ```
 
+**Managed Payments is off by default.** The form always sends an explicit
+`managed_payments[enabled]`, because newer Stripe accounts enable Managed Payments and then reject
+every session whose product has no tax code. A consumer that issues its own invoice (e-Factura, UBL)
+already owns tax and liability, so it should keep the default; set
+`StripeCheckoutRequest.ManagedPaymentsEnabled = true` to let Stripe handle tax instead (and give your
+prices a `tax_code`).
+
 `StripeBillingProvider.BuildHostedCheckoutForm(request)` is the pure part: it returns the
 `v1/checkout/sessions` form body, performs no I/O, and validates before any network call. Empty
 `UserId` (or longer than 200 characters), non-positive `AmountMinor`, missing `ProductName`, a mode

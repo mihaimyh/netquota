@@ -313,6 +313,19 @@ public class StripeHostedCheckoutTests
         Assert.DoesNotContain(form.Keys, key => key.StartsWith("subscription_data", StringComparison.Ordinal));
         Assert.DoesNotContain("line_items[0][price_data][recurring][interval]", form.Keys);
         Assert.DoesNotContain("customer_email", form.Keys);
+
+        // Managed Payments stays off unless the caller asks for it: a consumer that issues its own
+        // e-Factura owns tax, and an account-level default of "on" rejects the session without a
+        // product tax code.
+        Assert.Equal("false", form["managed_payments[enabled]"]);
+    }
+
+    [Fact]
+    public void BuildHostedCheckoutForm_ManagedPaymentsCanBeRequestedExplicitly()
+    {
+        var form = Build(PaymentRequest() with { ManagedPaymentsEnabled = true });
+
+        Assert.Equal("true", form["managed_payments[enabled]"]);
     }
 
     [Fact]

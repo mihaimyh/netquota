@@ -423,6 +423,9 @@ public sealed class StripeBillingProvider
             ["success_url"] = request.SuccessUrl,
             ["cancel_url"] = request.CancelUrl,
             ["client_reference_id"] = request.UserId,
+            // Explicit, never inherited from the account default: newer Stripe accounts enable Managed
+            // Payments, which then rejects every session without a product tax code.
+            ["managed_payments[enabled]"] = request.ManagedPaymentsEnabled ? "true" : "false",
             ["line_items[0][quantity]"] = "1",
             ["line_items[0][price_data][currency]"] = request.Currency,
             ["line_items[0][price_data][unit_amount]"] = request.AmountMinor.ToString(CultureInfo.InvariantCulture),

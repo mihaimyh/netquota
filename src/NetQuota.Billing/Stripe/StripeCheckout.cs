@@ -32,6 +32,13 @@ public sealed record StripeCheckoutRequest
 
     public string? CustomerEmail { get; init; }
 
+    /// <summary>
+    /// Leave Stripe Managed Payments off. Defaults to <c>false</c> because a consumer that issues its
+    /// own invoice (e-Factura/UBL) already owns tax and liability: with the flag on, Stripe requires a
+    /// product tax code on every session and rejects the request without one.
+    /// </summary>
+    public bool ManagedPaymentsEnabled { get; init; }
+
     /// <summary>Consumer payload; copied to the session, the PaymentIntent and the Subscription.</summary>
     public IReadOnlyDictionary<string, string> Metadata { get; init; } =
         new Dictionary<string, string>(StringComparer.Ordinal);
