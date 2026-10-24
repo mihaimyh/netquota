@@ -9,6 +9,11 @@ namespace NetQuota.Billing.Stripe;
 /// <c>subscription_details.metadata</c> and <c>parent.subscription_details.metadata</c>).
 /// An unmapped price is never treated as the default tier: the event is ignored so the customer
 /// keeps their current entitlement instead of being silently downgraded.
+/// <para>
+/// <c>checkout.session.completed</c> is parsed into <see cref="BillingWebhookKind.CheckoutCompleted"/>
+/// (event only, never an entitlement write). Subscription-mode sessions and unpaid sessions are
+/// ignored: their entitlement arrives through <c>customer.subscription.*</c> / the payment webhooks.
+/// </para>
 /// </summary>
 public static class StripeWebhookParser
 {
@@ -46,6 +51,8 @@ public static class StripeWebhookParser
                     ParseCreditPurchase(BillingWebhookKind.OneTimePurchase, "amount_received", type, eventId, timestamp, obj, options),
                 "payment_intent.refunded" or "charge.refunded" =>
                     ParseCreditPurchase(BillingWebhookKind.Refund, "amount_refunded", type, eventId, timestamp, obj, options),
+                "checkout.session.completed" =>
+                    ParseCheckoutCompleted(type, eventId, timestamp, obj),
                 _ => BillingWebhookResult.Ignored($"unhandled event type {type}")
             };
         }
@@ -260,6 +267,80 @@ public static class StripeWebhookParser
                 ["payment_intent_id"] = Text(obj, "payment_intent") ?? Text(obj, "id") ?? string.Empty
             }
         });
+    }
+
+    /// <summary>
+    /// <c>checkout.session.completed</c> for a one-off, already-paid session. The parser only reads the
+    /// event: it never writes an entitlement, because the consumer decides what the metadata means.
+    /// </summary>
+    private static BillingWebhookResult ParseCheckoutCompleted(
+        string type,
+        string eventId,
+        DateTimeOffset timestamp,
+        JsonElement obj)
+    {
+        var metadata = SessionMetadata(obj);
+
+        // Metadata wins over client_reference_id (which a Payment Link may set to something else);
+        // either is better than guessing, and dropping the event keeps the caller from granting twice.
+        var userId = metadata.GetValueOrDefault("user_id") ?? Text(obj, "client_reference_id");
+        if (string.IsNullOrWhiteSpace(userId))
+        {
+            return BillingWebhookResult.Ignored("missing user id");
+        }
+
+        if (Text(obj, "mode") == "subscription")
+        {
+            // customer.subscription.* and invoice.paid own the tier; granting on checkout as well
+            // would apply the same purchase twice.
+            return BillingWebhookResult.Ignored("subscription mode; subscription events carry the entitlement");
+        }
+
+        // Checkout completes a session before the money lands for delayed payment methods (SEPA,
+        // Boleto): granting here would hand out the product for a payment that may still fail.
+        if (Text(obj, "payment_status") != "paid")
+        {
+            return BillingWebhookResult.Ignored("checkout session not paid");
+        }
+
+        return new BillingWebhookResult(BillingWebhookKind.CheckoutCompleted, new BillingWebhookEvent
+        {
+            UserId = userId,
+
+            // A checkout never changes a tier by itself; a consumer that sells tiers through a
+            // subscription gets the tier from customer.subscription.*.
+            NewTier = metadata.GetValueOrDefault("tier", string.Empty),
+            Provider = "stripe",
+            EventType = type,
+            EventId = eventId,
+            EventTimestamp = timestamp,
+            ProductId = metadata.GetValueOrDefault("product_id", string.Empty),
+            Store = "stripe",
+            Currency = (Text(obj, "currency") ?? string.Empty).ToLowerInvariant(),
+            PriceCents = Long(obj, "amount_total") ?? 0,
+            CancelAtPeriodEnd = null,
+            Metadata = metadata
+        });
+    }
+
+    /// <summary>The session's metadata dictionary, copied verbatim (values only; keys are the caller's).</summary>
+    private static Dictionary<string, string> SessionMetadata(JsonElement obj)
+    {
+        var metadata = new Dictionary<string, string>(StringComparer.Ordinal);
+        if (!obj.TryGetProperty("metadata", out var source) || source.ValueKind != JsonValueKind.Object)
+        {
+            return metadata;
+        }
+
+        foreach (var property in source.EnumerateObject())
+        {
+            if (Text(source, property.Name) is { } value)
+            {
+                metadata[property.Name] = value;
+            }
+        }
+
+        return metadata;
     }
 
     private static (string Tier, bool Known) ResolveTier(string? priceId, JsonElement obj, StripeOptions options)

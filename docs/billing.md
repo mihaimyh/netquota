@@ -56,6 +56,7 @@ Handled events:
 | `customer.subscription.deleted` | reconcile first; downgrade only when nothing else is active |
 | `payment_intent.succeeded` | grant credits (`metadata.user_id/resource/credits`), idempotent by event id |
 | `charge.refunded` / `payment_intent.refunded` | refund the individual refund's share, keyed by refund id (a full refund by payment intent) |
+| `checkout.session.completed` | emit `CheckoutCompleted` with the session's metadata and amount — no entitlement write |
 
 Rules that matter:
 
@@ -78,6 +79,69 @@ Rules that matter:
   `StatusCode`, `ErrorCode`, `ErrorMessage` and `RequestId`.
 - Entitlement rewrites go through `BillingEntitlementTransition.Merge`, preserving `Promotion`,
   `Timezone`, `Sealed`, `MigratedTo` and `SealExpiresAtUtc`.
+
+### Hosted checkout for a computed amount
+
+`CheckoutUrlAsync` needs a Price that already exists in Stripe. When the amount is computed at
+runtime (a report, a seat, a one-off service), use the inline-price variant: any amount, any
+metadata, and it returns both the session id and the redirect URL.
+
+```csharp
+var session = await stripe.CreateHostedCheckoutAsync(new StripeCheckoutRequest
+{
+    UserId = "u1",
+    AmountMinor = 4900,                       // bani; the amount is yours to compute
+    Currency = "ron",
+    ProductName = "Raport due diligence",
+    SuccessUrl = "https://app.example/report/ok",
+    CancelUrl = "https://app.example/report/cancel",
+    Metadata = new Dictionary<string, string> { ["report_id"] = "r_42" },
+    IdempotencyKey = "report-r-42"            // replaying the call returns the same session
+});
+
+return Results.Redirect(session.Url);          // session.SessionId for reconciliation
+```
+
+`StripeBillingProvider.BuildHostedCheckoutForm(request)` is the pure part: it returns the
+`v1/checkout/sessions` form body, performs no I/O, and validates before any network call. Empty
+`UserId` (or longer than 200 characters), non-positive `AmountMinor`, missing `ProductName`, a mode
+other than `payment`/`subscription`, a subscription without a valid `RecurringInterval`
+(`day`/`week`/`month`/`year`) or a payment that sets one, a currency that is not three lowercase
+letters, metadata beyond Stripe's limits (50 pairs, 40-character keys without `[`/`]`,
+500-character values) and an `IdempotencyKey` over 255 characters all throw `ArgumentException`.
+
+**Metadata is mirrored, not inherited.** Stripe does not copy session metadata to the PaymentIntent
+or to the Subscription, so every pair is written three times: `metadata[...]` on the session,
+`payment_intent_data[metadata][...]` for `mode=payment`, `subscription_data[metadata][...]` for
+`mode=subscription`. Without that mirroring, the refund or renewal webhook that describes the money
+arrives without the fields needed to act on it. `metadata[user_id]` is always present and always the
+request's `UserId`, overwriting a caller-supplied value.
+
+Sessions created this way do not create or reuse a Stripe customer (`client_reference_id` plus the
+optional `customer_email` instead), so nothing is written to `IBillingCustomerStore`.
+
+### checkout.session.completed
+
+`checkout.session.completed` for a paid one-off session becomes
+`BillingWebhookKind.CheckoutCompleted`:
+
+| Field | Source |
+| --- | --- |
+| `UserId` | `metadata[user_id]`, falling back to `client_reference_id`; both missing → `Ignored("missing user id")` |
+| `EventId` / `EventTimestamp` | the event root's `id` / `created` (dedupe key) |
+| `Currency` / `PriceCents` | `currency` (lowercase, unlike subscription events) / `amount_total` |
+| `ProductId` / `NewTier` | `metadata[product_id]` (empty when absent) / `metadata[tier]` or `""` |
+| `Metadata` | the session's metadata dictionary, verbatim — keys are the caller's, never interpreted |
+| `Provider` / `Store` / `EventType` | `stripe` / `stripe` / `checkout.session.completed` |
+
+The parser is pure and writes no entitlement: the caller decides what the metadata buys, under its
+own idempotency key (the event id). Deliberately not supported, because guessing would double-grant:
+
+- **`mode=subscription` → `Ignored`.** `customer.subscription.*` / `invoice.paid` already carry the
+  tier for that purchase; acting on both would apply the same subscription twice.
+- **`payment_status != paid` → `Ignored`.** Delayed payment methods (SEPA, Boleto) complete a session
+  before the money lands; granting on `completed` alone hands out the product for a payment that may
+  still fail. This variant intentionally does not handle `checkout.session.async_payment_succeeded`.
 
 ## RevenueCat
 

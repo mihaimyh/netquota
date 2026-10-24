@@ -10,6 +10,22 @@ namespace NetQuota.Billing.Stripe;
 /// </summary>
 public sealed class StripeBillingProvider
 {
+    // Limits from Stripe's API reference, checked before any network call so a request that Stripe
+    // would reject with a 400 fails locally with a precise message instead.
+    // https://docs.stripe.com/api/metadata — 50 pairs, 40-char keys, 500-char values.
+    // https://docs.stripe.com/api/checkout/sessions/create — client_reference_id ≤ 200 chars.
+    // https://docs.stripe.com/api/idempotent_requests — Idempotency-Key ≤ 255 chars.
+    private const int MaxMetadataPairs = 50;
+    private const int MaxMetadataKeyLength = 40;
+    private const int MaxMetadataValueLength = 500;
+    private const int MaxClientReferenceIdLength = 200;
+    private const int MaxIdempotencyKeyLength = 255;
+
+    private const string PaymentMode = "payment";
+    private const string SubscriptionMode = "subscription";
+
+    private static readonly string[] RecurringIntervals = ["day", "week", "month", "year"];
+
     private readonly StripeOptions _options;
     private readonly IBillingEntitlementStore _store;
     private readonly IBillingCustomerStore _customers;
@@ -350,6 +366,180 @@ public sealed class StripeBillingProvider
         };
 
         return await CreateSessionAsync(form, cancellationToken);
+    }
+
+    /// <summary>
+    /// Hosted Checkout for an amount the caller computed: no pre-created Price, no customer link and
+    /// no assumption about what is being sold. The caller's metadata is mirrored onto the session,
+    /// the PaymentIntent (or Subscription) and returned verbatim by the checkout webhook.
+    /// </summary>
+    public async Task<StripeCheckoutSession> CreateHostedCheckoutAsync(
+        StripeCheckoutRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        var form = BuildHostedCheckoutForm(request);
+
+        using var content = new FormUrlEncodedContent(form);
+        using var message = new HttpRequestMessage(HttpMethod.Post, "v1/checkout/sessions") { Content = content };
+
+        if (!string.IsNullOrWhiteSpace(request.IdempotencyKey))
+        {
+            message.Headers.Add("Idempotency-Key", request.IdempotencyKey);
+        }
+
+        using var response = await _http.SendAsync(message, cancellationToken);
+        using var document = await BillingHttpResponse.ReadJsonOrThrowAsync(response, Name, cancellationToken);
+        var sessionId = StripeWebhookParser.Text(document.RootElement, "id")
+                        ?? throw new BillingNotSupportedException("Stripe checkout session returned no id.");
+        var url = StripeWebhookParser.Text(document.RootElement, "url")
+                  ?? throw new BillingNotSupportedException("Stripe returned no redirect URL.");
+
+        return new StripeCheckoutSession(sessionId, url);
+    }
+
+    /// <summary>
+    /// Pure builder for the <c>v1/checkout/sessions</c> form body; validates, never performs I/O.
+    /// <para>
+    /// Stripe does <b>not</b> copy session metadata onto the PaymentIntent or the Subscription, so
+    /// every pair is mirrored explicitly — otherwise the object a refund or renewal event describes
+    /// arrives without the fields needed to act on it.
+    /// </para>
+    /// </summary>
+    public static IReadOnlyDictionary<string, string> BuildHostedCheckoutForm(StripeCheckoutRequest request)
+    {
+        ArgumentNullException.ThrowIfNull(request);
+        ValidateCheckoutRequest(request);
+
+        // The user id is always ours: a caller-supplied metadata["user_id"] must not redirect the
+        // grant to a different user.
+        var metadata = new Dictionary<string, string>(request.Metadata, StringComparer.Ordinal)
+        {
+            ["user_id"] = request.UserId
+        };
+
+        var form = new Dictionary<string, string>(StringComparer.Ordinal)
+        {
+            ["mode"] = request.Mode,
+            ["success_url"] = request.SuccessUrl,
+            ["cancel_url"] = request.CancelUrl,
+            ["client_reference_id"] = request.UserId,
+            ["line_items[0][quantity]"] = "1",
+            ["line_items[0][price_data][currency]"] = request.Currency,
+            ["line_items[0][price_data][unit_amount]"] = request.AmountMinor.ToString(CultureInfo.InvariantCulture),
+            ["line_items[0][price_data][product_data][name]"] = request.ProductName
+        };
+
+        if (!string.IsNullOrWhiteSpace(request.CustomerEmail))
+        {
+            form["customer_email"] = request.CustomerEmail;
+        }
+
+        var subscription = request.Mode == SubscriptionMode;
+        if (subscription)
+        {
+            form["line_items[0][price_data][recurring][interval]"] = request.RecurringInterval!;
+        }
+
+        var nestedPrefix = subscription
+            ? "subscription_data[metadata]["
+            : "payment_intent_data[metadata][";
+
+        foreach (var (key, value) in metadata)
+        {
+            form[$"metadata[{key}]"] = value;
+            form[$"{nestedPrefix}{key}]"] = value;
+        }
+
+        return form;
+    }
+
+    private static void ValidateCheckoutRequest(StripeCheckoutRequest request)
+    {
+        if (string.IsNullOrWhiteSpace(request.UserId))
+        {
+            throw new ArgumentException("UserId is required.", nameof(request.UserId));
+        }
+
+        if (request.UserId.Length > MaxClientReferenceIdLength)
+        {
+            throw new ArgumentException(
+                $"UserId must be at most {MaxClientReferenceIdLength} characters (Stripe client_reference_id limit).",
+                nameof(request.UserId));
+        }
+
+        if (request.AmountMinor <= 0)
+        {
+            throw new ArgumentException(
+                "AmountMinor must be positive and expressed in the currency's minor unit.",
+                nameof(request.AmountMinor));
+        }
+
+        if (string.IsNullOrWhiteSpace(request.ProductName))
+        {
+            throw new ArgumentException("ProductName is required.", nameof(request.ProductName));
+        }
+
+        if (request.Mode is not (PaymentMode or SubscriptionMode))
+        {
+            throw new ArgumentException(
+                $"Mode must be '{PaymentMode}' or '{SubscriptionMode}'.", nameof(request.Mode));
+        }
+
+        if (request.Mode == SubscriptionMode)
+        {
+            if (request.RecurringInterval is null || Array.IndexOf(RecurringIntervals, request.RecurringInterval) < 0)
+            {
+                throw new ArgumentException(
+                    $"RecurringInterval is required for mode=subscription and must be one of: {string.Join(", ", RecurringIntervals)}.",
+                    nameof(request.RecurringInterval));
+            }
+        }
+        else if (request.RecurringInterval is not null)
+        {
+            throw new ArgumentException(
+                $"RecurringInterval must be null for mode={PaymentMode}.", nameof(request.RecurringInterval));
+        }
+
+        if (request.Currency.Length != 3 || !request.Currency.All(char.IsAsciiLetterLower))
+        {
+            throw new ArgumentException(
+                "Currency must be a three-letter lowercase ISO code, e.g. 'ron' or 'eur'.",
+                nameof(request.Currency));
+        }
+
+        if (request.Metadata.Count > MaxMetadataPairs)
+        {
+            throw new ArgumentException(
+                $"Metadata must contain at most {MaxMetadataPairs} pairs (Stripe limit).",
+                nameof(request.Metadata));
+        }
+
+        foreach (var (key, value) in request.Metadata)
+        {
+            if (string.IsNullOrWhiteSpace(key) ||
+                key.Length > MaxMetadataKeyLength ||
+                key.Contains('[') ||
+                key.Contains(']'))
+            {
+                throw new ArgumentException(
+                    $"Metadata keys must be non-empty, at most {MaxMetadataKeyLength} characters and must not contain '[' or ']' (Stripe limit).",
+                    nameof(request.Metadata));
+            }
+
+            if (value is null || value.Length > MaxMetadataValueLength)
+            {
+                throw new ArgumentException(
+                    $"Metadata values must be at most {MaxMetadataValueLength} characters (Stripe limit).",
+                    nameof(request.Metadata));
+            }
+        }
+
+        if (request.IdempotencyKey is { Length: > MaxIdempotencyKeyLength })
+        {
+            throw new ArgumentException(
+                $"IdempotencyKey must be at most {MaxIdempotencyKeyLength} characters (Stripe limit).",
+                nameof(request.IdempotencyKey));
+        }
     }
 
     public async Task<string> PortalUrlAsync(

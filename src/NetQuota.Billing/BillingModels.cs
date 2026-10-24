@@ -64,13 +64,25 @@ public sealed record BillingWebhookEvent
     public IReadOnlyDictionary<string, string> Metadata { get; init; } = new Dictionary<string, string>();
 }
 
+/// <summary>
+/// What a webhook event means for the caller. New members are appended, never inserted: consumers
+/// may persist the numeric value (<see cref="CheckoutCompleted"/> == 5).
+/// </summary>
 public enum BillingWebhookKind
 {
     Subscription,
     OneTimePurchase,
     Refund,
     Transfer,
-    Ignored
+    Ignored,
+
+    /// <summary>
+    /// Stripe <c>checkout.session.completed</c> for a paid one-off session. It carries the consumer's
+    /// metadata and the amount, but <b>no entitlement change</b>: the caller decides what to grant.
+    /// Subscription-mode sessions are ignored because <c>customer.subscription.*</c> owns the tier,
+    /// and unpaid sessions (delayed payment methods) are ignored too.
+    /// </summary>
+    CheckoutCompleted
 }
 
 public sealed record BillingWebhookResult(
