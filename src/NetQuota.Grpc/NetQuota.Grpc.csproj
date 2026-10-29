@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <ItemGroup>
+    <PackageReference Include="Grpc.Core.Api" Version="2.71.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\NetQuota\NetQuota.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <PackageId>NetQuota.Grpc</PackageId>
+    <Description>gRPC server interceptor and status mapping for NetQuota: quota and rate-limit denials surface as ResourceExhausted instead of Unknown.</Description>
+  </PropertyGroup>
+
+</Project>

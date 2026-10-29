@@ -26,6 +26,7 @@
     <ProjectReference Include="..\..\src\NetQuota.AspNetCore\NetQuota.AspNetCore.csproj" />
     <ProjectReference Include="..\..\src\NetQuota.Billing\NetQuota.Billing.csproj" />
     <ProjectReference Include="..\..\src\NetQuota.Firestore\NetQuota.Firestore.csproj" />
+    <ProjectReference Include="..\..\src\NetQuota.Grpc\NetQuota.Grpc.csproj" />
     <ProjectReference Include="..\..\src\NetQuota.Postgres\NetQuota.Postgres.csproj" />
     <ProjectReference Include="..\..\src\NetQuota.Redis\NetQuota.Redis.csproj" />
   </ItemGroup>

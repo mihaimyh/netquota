@@ -44,7 +44,7 @@ jobs:
         run: dotnet test NetQuota.slnx -c Release --no-build
 
       - name: Pack
-        # Every packable csproj produces its own package (six in total).
+        # Every packable csproj produces its own package (seven in total).
         run: dotnet pack NetQuota.slnx -c Release --no-build -o artifacts/packages -p:Version=${{ steps.gitversion.outputs.semVer }}
 
       - name: Verify packages

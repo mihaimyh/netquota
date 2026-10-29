@@ -4,6 +4,7 @@
     <Project Path="src/NetQuota.AspNetCore/NetQuota.AspNetCore.csproj" />
     <Project Path="src/NetQuota.Billing/NetQuota.Billing.csproj" />
     <Project Path="src/NetQuota.Firestore/NetQuota.Firestore.csproj" />
+    <Project Path="src/NetQuota.Grpc/NetQuota.Grpc.csproj" />
     <Project Path="src/NetQuota.Postgres/NetQuota.Postgres.csproj" />
     <Project Path="src/NetQuota.Redis/NetQuota.Redis.csproj" />
   </Folder>

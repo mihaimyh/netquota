@@ -5,9 +5,9 @@ description: Use when adding or changing quotas, rate limits, tiered entitlement
 
 # NetQuota
 
-Transactional quota and rate-limiting library for .NET (`net11.0`). Packages:
+Transactional quota and rate-limiting library for .NET (`net10.0`). Packages:
 `NetQuota`, `NetQuota.Firestore`, `NetQuota.Redis`, `NetQuota.Postgres`,
-`NetQuota.AspNetCore`, `NetQuota.Billing`.
+`NetQuota.AspNetCore`, `NetQuota.Billing`, `NetQuota.Grpc`.
 
 ## When to use
 

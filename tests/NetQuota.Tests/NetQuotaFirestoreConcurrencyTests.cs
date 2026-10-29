@@ -777,11 +777,11 @@ public class NetQuotaFirestoreConcurrencyTests
             {
                 return await action();
             }
-            catch (Grpc.Core.RpcException ex) when (
+            catch (global::Grpc.Core.RpcException ex) when (
                 attempt < 6 &&
-                ex.StatusCode is Grpc.Core.StatusCode.Aborted
-                    or Grpc.Core.StatusCode.Unavailable
-                    or Grpc.Core.StatusCode.DeadlineExceeded)
+                ex.StatusCode is global::Grpc.Core.StatusCode.Aborted
+                    or global::Grpc.Core.StatusCode.Unavailable
+                    or global::Grpc.Core.StatusCode.DeadlineExceeded)
             {
                 await Task.Delay(TimeSpan.FromMilliseconds(100 * (attempt + 1)));
             }

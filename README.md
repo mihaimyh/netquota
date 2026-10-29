@@ -17,6 +17,7 @@ the production bugs found in the original library (see `docs/adapters.md`).
 | `NetQuota.Postgres` | PostgreSQL adapter (row locks + advisory locks, merges, audit log) |
 | `NetQuota.AspNetCore` | Rate limiter bridge, endpoint filter, `/usage` endpoint, headers |
 | `NetQuota.Billing` | Stripe and RevenueCat webhooks, checkout, transfers, reconciliation |
+| `NetQuota.Grpc` | gRPC server interceptor: quota/rate-limit denials map to `ResourceExhausted` |
 
 All packages target `net10.0` (LTS until November 2028).
 
@@ -133,6 +134,7 @@ handled without silently downgrading users. See `docs/billing.md`.
 - [`docs/adapters.md`](docs/adapters.md) — Firestore / Redis / PostgreSQL, retention, semantics
 - [`docs/aspnetcore.md`](docs/aspnetcore.md) — middleware, usage endpoint, headers
 - [`docs/billing.md`](docs/billing.md) — Stripe and RevenueCat integration
+- [`docs/grpc.md`](docs/grpc.md) — gRPC interceptor and status mapping
 - [`docs/operations.md`](docs/operations.md) — metrics, pruning, failure modes
 - [`docs/publishing.md`](docs/publishing.md) — release tags, GitVersion, NuGet Trusted Publishing
 - [`skills/netquota/SKILL.md`](skills/netquota/SKILL.md) — agent skill
